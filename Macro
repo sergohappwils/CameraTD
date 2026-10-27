@@ -1,7 +1,3 @@
--- ====================================================================
--- CAMERA TD // PRECISION ENGINE v4.7.2 (GITHUB AUTO-EXEC + MOBILE)
--- Repo: https://raw.githubusercontent.com/sergohappwils/CameraTD/refs/heads/main/Macro
--- ====================================================================
 
 if not game:IsLoaded() then
     game.Loaded:Wait()
