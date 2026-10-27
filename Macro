@@ -1,30 +1,31 @@
 -- ====================================================================
--- CAMERA TD // PRECISION ENGINE v4.7.1 (ORIGINAL ENGINE + 7s AUTO-EXEC)
--- PlaceId: 114068177100380 | Live Config Prices | Smart Wave-Skip Filter
+-- CAMERA TD // PRECISION ENGINE v4.7.2 (GITHUB AUTO-EXEC + MOBILE)
+-- Repo: https://raw.githubusercontent.com/sergohappwils/CameraTD/refs/heads/main/Macro
 -- ====================================================================
 
 if not game:IsLoaded() then
     game.Loaded:Wait()
 end
 
--- ==================== SAVED 7-SECOND STARTUP DELAY ====================
+local GITHUB_URL = "https://raw.githubusercontent.com/sergohappwils/CameraTD/refs/heads/main/Macro"
 local FOLDER = "CameraTD_Macro"
 local DELAY_FILE = FOLDER .. "/startup_delay.txt"
 local AUTOEXEC_FILE = FOLDER .. "/autoexec_cache.luau"
 
+-- ==================== 1. STARTUP DELAY (DEFAULT 7s) ====================
 local bootDelay = 7
 pcall(function()
     if isfile and readfile and isfile(DELAY_FILE) then
-        local num = tonumber(readfile(DELAY_FILE))
+        local num = tonumber(readfile(DELAY_FILE):match("([%d%.]+)"))
         if num and num >= 1 and num <= 60 then
             bootDelay = num
         end
     end
 end)
 
-wait(bootDelay)
+task.wait(bootDelay)
 
--- ==================== SINGLETON CLEANUP GUARD ====================
+-- ==================== 2. SINGLETON CLEANUP GUARD ====================
 local ENV = (getgenv and getgenv()) or _G
 if ENV.__CAM_TD_CONTROLLER then
     pcall(function()
@@ -33,34 +34,26 @@ if ENV.__CAM_TD_CONTROLLER then
     task.wait(0.15)
 end
 
-local Controller = {
-    Running = true,
-    Connections = {}
-}
+local Controller = { Running = true, Connections = {} }
 ENV.__CAM_TD_CONTROLLER = Controller
 _G.__CAM_TD_MACRO = true
 
-local function trackConn(conn: RBXScriptConnection?): RBXScriptConnection?
-    if conn then
-        table.insert(Controller.Connections, conn)
-    end
+local function trackConn(conn)
+    if conn then table.insert(Controller.Connections, conn) end
     return conn
 end
 
--- ==================== SERVICES ====================
+-- ==================== 3. SERVICES & FILESYSTEM ====================
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local HttpService = game:GetService("HttpService")
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local VirtualUser = nil
-pcall(function()
-    VirtualUser = game:GetService("VirtualUser")
-end)
+pcall(function() VirtualUser = game:GetService("VirtualUser") end)
 
 local LP = Players.LocalPlayer or Players.PlayerAdded:Wait()
 
--- ==================== DIRECTORIES & PERSISTENCE ====================
 local MACRO_FOLDER = FOLDER .. "/macros"
 local SETTINGS_FILE = FOLDER .. "/" .. LP.Name .. "_settings.json"
 local SHARED_SKIP_FILE = FOLDER .. "/shared_skip_waves.txt"
@@ -76,7 +69,7 @@ local function ensureFolders()
 end
 ensureFolders()
 
-local function saveJSON(path: string, data: any): boolean
+local function saveJSON(path, data)
     local ok = false
     pcall(function()
         if writefile then
@@ -88,25 +81,21 @@ local function saveJSON(path: string, data: any): boolean
     return ok
 end
 
-local function loadJSON(path: string): any
+local function loadJSON(path)
     if not isfile or not readfile then return nil end
     local exists = false
     pcall(function() exists = isfile(path) end)
     if not exists then return nil end
-    local ok, res = pcall(function()
-        return HttpService:JSONDecode(readfile(path))
-    end)
+    local ok, res = pcall(function() return HttpService:JSONDecode(readfile(path)) end)
     return (ok and type(res) == "table") and res or nil
 end
 
-local function listMacroFiles(): {string}
-    local names = {}
-    local seen = {}
+local function listMacroFiles()
+    local names, seen = {}, {}
     pcall(function()
         if listfiles and isfolder and isfolder(MACRO_FOLDER) then
             for _, file in ipairs(listfiles(MACRO_FOLDER)) do
-                local normalized = tostring(file):gsub("\\", "/")
-                local name = normalized:match("([^/]+)%.json$")
+                local name = tostring(file):gsub("\\", "/"):match("([^/]+)%.json$")
                 if name and not seen[name] then
                     seen[name] = true
                     table.insert(names, name)
@@ -146,9 +135,7 @@ end
 pcall(function()
     if S.syncSkipMultiAcc and isfile and readfile and isfile(SHARED_SKIP_FILE) then
         local sharedFilter = readfile(SHARED_SKIP_FILE)
-        if type(sharedFilter) == "string" then
-            S.noSkipWaves = sharedFilter
-        end
+        if type(sharedFilter) == "string" then S.noSkipWaves = sharedFilter end
     end
 end)
 
@@ -158,7 +145,6 @@ S.paused = false
 S.skipCurrentStep = false
 S.macro = nil
 S.macroPlayed = false
-S.hasVotedReplay = false
 S.currentStepIndex = 0
 S.totalSteps = 0
 S.currentStepText = "Idle"
@@ -166,9 +152,7 @@ S.teleportQueued = false
 
 local function saveS()
     local t = {}
-    for k in pairs(DEFAULTS) do
-        t[k] = S[k]
-    end
+    for k in pairs(DEFAULTS) do t[k] = S[k] end
     saveJSON(SETTINGS_FILE, t)
     if writefile then
         pcall(function()
@@ -182,45 +166,7 @@ local function saveS()
 end
 saveS()
 
--- ==================== WAVE SKIP FILTER PARSER ====================
-local function isWaveSkipBlocked(wave: number, filterStr: string?): boolean
-    if not wave or wave <= 0 then return false end
-    local raw = tostring(filterStr or "")
-    if raw == "" then return false end
-
-    for token in raw:gmatch("[^,;]+") do
-        local s = token:match("^%s*(.-)%s*$")
-        if s ~= "" then
-            local rStart, rEnd = s:match("^(%d+)%s*%-%s*(%d+)$")
-            if rStart and rEnd then
-                local a = tonumber(rStart)
-                local b = tonumber(rEnd)
-                if a and b then
-                    if a > b then a, b = b, a end
-                    if wave >= a and wave <= b then
-                        return true
-                    end
-                end
-            else
-                local plusWave = s:match("^(%d+)%s*%+$")
-                if plusWave then
-                    local a = tonumber(plusWave)
-                    if a and wave >= a then
-                        return true
-                    end
-                else
-                    local single = tonumber(s)
-                    if single and wave == single then
-                        return true
-                    end
-                end
-            end
-        end
-    end
-    return false
-end
-
--- ==================== COLOR PALETTE & LOGGING ====================
+-- ==================== 4. COLORS & LOGGING ====================
 local C = {
     Bg     = Color3.fromRGB(13, 15, 19),
     Bg2    = Color3.fromRGB(20, 23, 30),
@@ -241,68 +187,107 @@ local logDirty = false
 local timelineDirty = true
 local fileListDirty = true
 
-local function addLog(text: string, color: Color3?)
+local function addLog(text, color)
     local line = os.date("%H:%M:%S") .. " | " .. text
     table.insert(logEntries, 1, { t = line, c = color or C.Dim })
-    if #logEntries > 60 then
-        logEntries[61] = nil
-    end
+    if #logEntries > 60 then logEntries[61] = nil end
     logDirty = true
-
     pcall(function()
-        if appendfile and isfile then
-            if isfile(LOG_FILE) then
-                appendfile(LOG_FILE, line .. "\n")
-            elseif writefile then
-                writefile(LOG_FILE, line .. "\n")
-            end
+        if appendfile and isfile and isfile(LOG_FILE) then
+            appendfile(LOG_FILE, line .. "\n")
+        elseif writefile then
+            writefile(LOG_FILE, line .. "\n")
         end
     end)
     print("[CameraTD] " .. text)
 end
 
--- ==================== AUTO-EXECUTE HANDLER ====================
-local function setupAutoExecute(showLog: boolean?)
-    pcall(function()
-        local getclip = getclipboard or fromclipboard
-        if getclip and writefile then
-            local clip = getclip()
-            if type(clip) == "string" and clip:find("CAMERA TD") then
-                writefile(AUTOEXEC_FILE, clip)
-            end
-        end
-    end)
-
+-- ==================== 5. GITHUB + TELEPORT AUTO-EXECUTE ====================
+local function armAutoExecute(showLog)
     local qFunc = queue_on_teleport
         or queueonteleport
         or (syn and syn.queue_on_teleport)
         or (fluxus and fluxus.queue_on_teleport)
+        or (ENV and (ENV.queue_on_teleport or ENV.queueonteleport))
 
-    if qFunc and not S.teleportQueued then
-        pcall(function()
-            qFunc(string.format([[
-                if isfile and readfile and isfile(%q) then
-                    local fn = loadstring(readfile(%q))
-                    if fn then task.spawn(fn) end
-                end
-            ]], AUTOEXEC_FILE, AUTOEXEC_FILE))
-            S.teleportQueued = true
-        end)
+    if not qFunc then
+        if showLog then addLog("❌ Executor missing queue_on_teleport", C.Bad) end
+        return false
     end
 
-    if showLog then
-        addLog(string.format("⚡ Auto-Execute Armed (Delay: %ds)", S.startupDelay or 7), C.Ok)
+    if not S.teleportQueued then
+        local payload = string.format([[
+            if not game:IsLoaded() then game.Loaded:Wait() end
+            local ok, src = pcall(function()
+                return game:HttpGet(%q .. "?t=" .. tostring(os.time()))
+            end)
+            if ok and type(src) == "string" and #src > 100 then
+                if writefile then pcall(writefile, %q, src) end
+                local fn = loadstring(src)
+                if fn then task.spawn(fn) return end
+            end
+            if isfile and readfile and isfile(%q) then
+                local fn = loadstring(readfile(%q))
+                if fn then task.spawn(fn) end
+            end
+        ]], GITHUB_URL, AUTOEXEC_FILE, AUTOEXEC_FILE, AUTOEXEC_FILE)
+
+        local ok, err = pcall(qFunc, payload)
+        if ok then
+            S.teleportQueued = true
+            if showLog then addLog("✅ Auto-Execute Armed (GitHub Live + Cache)!", C.Ok) end
+            return true
+        else
+            if showLog then addLog("❌ Auto-Exec Error: " .. tostring(err), C.Bad) end
+            return false
+        end
+    else
+        if showLog then addLog("✅ Auto-Execute is already armed for teleport!", C.Ok) end
+        return true
     end
 end
 
+if S.autoExecute then
+    armAutoExecute(false)
+end
+
 trackConn(LP.OnTeleport:Connect(function()
-    if S.autoExecute then
-        setupAutoExecute(false)
+    if S.autoExecute and not S.teleportQueued then
+        armAutoExecute(false)
     end
 end))
 
--- ==================== PERSISTENT FPS LOCK & ANTI-AFK ====================
-local function applyFPSCap(fps: number?)
+-- ==================== 6. WAVE SKIP FILTER & FPS LOCK ====================
+local function isWaveSkipBlocked(wave, filterStr)
+    if not wave or wave <= 0 then return false end
+    local raw = tostring(filterStr or "")
+    if raw == "" then return false end
+    for token in raw:gmatch("[^,;]+") do
+        local s = token:match("^%s*(.-)%s*$")
+        if s ~= "" then
+            local rStart, rEnd = s:match("^(%d+)%s*%-%s*(%d+)$")
+            if rStart and rEnd then
+                local a, b = tonumber(rStart), tonumber(rEnd)
+                if a and b then
+                    if a > b then a, b = b, a end
+                    if wave >= a and wave <= b then return true end
+                end
+            else
+                local plusWave = s:match("^(%d+)%s*%+$")
+                if plusWave then
+                    local a = tonumber(plusWave)
+                    if a and wave >= a then return true end
+                else
+                    local single = tonumber(s)
+                    if single and wave == single then return true end
+                end
+            end
+        end
+    end
+    return false
+end
+
+local function applyFPSCap(fps)
     local cap = math.clamp(math.floor(fps or S.fpsCap or 15), 5, 144)
     pcall(function()
         local setfps = setfpscap or set_fps_cap
@@ -318,12 +303,6 @@ task.spawn(function()
     end
 end)
 
-trackConn(UserInputService.WindowFocused:Connect(function()
-    if Controller.Running then
-        applyFPSCap(S.fpsCap)
-    end
-end))
-
 trackConn(LP.Idled:Connect(function()
     pcall(function()
         if VirtualUser then
@@ -336,12 +315,10 @@ end))
 pcall(function()
     local ps = LP:FindFirstChild("PlayerScripts")
     local antiMacro = ps and ps:FindFirstChild("AntiMacro")
-    if antiMacro and antiMacro:IsA("LocalScript") then
-        antiMacro.Disabled = true
-    end
+    if antiMacro and antiMacro:IsA("LocalScript") then antiMacro.Disabled = true end
 end)
 
--- ==================== DYNAMIC GAME REFERENCES ====================
+-- ==================== 7. GAME STATE & ECONOMY HELPERS ====================
 local playerGui = LP:FindFirstChildOfClass("PlayerGui")
 local gameUI = playerGui and playerGui:FindFirstChild("GameUI")
 local gameFolder = workspace:FindFirstChild("Game")
@@ -350,7 +327,7 @@ local ConfigTowers = {}
 local Remotes = {}
 local EngineReady = false
 
-local function applyVFXSetting(disable: boolean)
+local function applyVFXSetting(disable)
     pcall(function()
         if shared and shared.Modules and shared.Modules.Replication then
             local rep = shared.Modules.Replication.GetCurrentReplica()
@@ -361,14 +338,12 @@ local function applyVFXSetting(disable: boolean)
     end)
 end
 
--- ==================== ECONOMY & MATCH STATE HELPERS ====================
-local function getCash(): number
+local function getCash()
     local leaderstats = LP:FindFirstChild("leaderstats")
     local moneyObj = leaderstats and leaderstats:FindFirstChild("Money")
     if moneyObj and moneyObj:IsA("ValueBase") then
         return tonumber(moneyObj.Value) or 0
     end
-
     if not gameUI then
         playerGui = LP:FindFirstChildOfClass("PlayerGui")
         gameUI = playerGui and playerGui:FindFirstChild("GameUI")
@@ -378,14 +353,13 @@ local function getCash(): number
         and gameUI.Stats.OtherUI:FindFirstChild("Money")
         and gameUI.Stats.OtherUI.Money:FindFirstChild("Title")
     if title and title:IsA("TextLabel") and title.Text ~= "" then
-        local clean = title.Text:gsub("[^%d]", "")
-        local val = tonumber(clean)
+        local val = tonumber(title.Text:gsub("[^%d]", ""))
         if val then return val end
     end
     return 0
 end
 
-local function isGameOver(): boolean
+local function isGameOver()
     local msg = workspace:GetAttribute("Message")
     if msg == "You Won!" or msg == "You Lost!" then return true end
     local timer = tonumber(workspace:GetAttribute("PlayAgainTimer"))
@@ -399,7 +373,25 @@ local function isGameOver(): boolean
     return false
 end
 
-local function isVotingActive(): boolean
+local function hasVotedPlayAgain()
+    local votersJson = workspace:GetAttribute("PlayAgainVoters")
+    if type(votersJson) == "string" and votersJson ~= "" then
+        local ok, list = pcall(function() return HttpService:JSONDecode(votersJson) end)
+        if ok and type(list) == "table" and table.find(list, LP.UserId) ~= nil then
+            return true
+        end
+    end
+    local btnLbl = gameUI and gameUI:FindFirstChild("FinalUI")
+        and gameUI.FinalUI:FindFirstChild("Content")
+        and gameUI.FinalUI.Content:FindFirstChild("PlayAgain")
+        and gameUI.FinalUI.Content.PlayAgain:FindFirstChildWhichIsA("TextLabel")
+    if btnLbl and btnLbl.Text == "Cancel" then
+        return true
+    end
+    return false
+end
+
+local function isVotingActive()
     if workspace:GetAttribute("IsVoting") == true then return true end
     if not gameUI then
         playerGui = LP:FindFirstChildOfClass("PlayerGui")
@@ -410,18 +402,18 @@ local function isVotingActive(): boolean
     return false
 end
 
-local function isMatchActive(): boolean
+local function isMatchActive()
     if isGameOver() or isVotingActive() then return false end
     if workspace:GetAttribute("GameState") == "Restarting" then return false end
     local wave = tonumber(workspace:GetAttribute("Wave"))
     return wave ~= nil and wave >= 1
 end
 
-local function getDistanceXZ(pos1: Vector3, pos2: Vector3): number
+local function getDistanceXZ(pos1, pos2)
     return math.sqrt((pos1.X - pos2.X)^2 + (pos1.Z - pos2.Z)^2)
 end
 
-local function getTowerPlacementCost(towerName: string, recordedCost: number?): number
+local function getTowerPlacementCost(towerName, recordedCost)
     if recordedCost and tonumber(recordedCost) and tonumber(recordedCost) > 0 then
         return tonumber(recordedCost)
     end
@@ -430,8 +422,7 @@ local function getTowerPlacementCost(towerName: string, recordedCost: number?): 
             local slotGui = gameUI and gameUI:FindFirstChild("Slots") and gameUI.Slots:FindFirstChild("Slot" .. slot)
             local pLbl = slotGui and slotGui:FindFirstChild("TroopFrame") and slotGui.TroopFrame:FindFirstChild("Price")
             if pLbl and pLbl:IsA("TextLabel") then
-                local clean = pLbl.Text:gsub("[^%d]", "")
-                local num = tonumber(clean)
+                local num = tonumber(pLbl.Text:gsub("[^%d]", ""))
                 if num and num > 0 then return num end
             end
         end
@@ -443,7 +434,7 @@ local function getTowerPlacementCost(towerName: string, recordedCost: number?): 
     return 100
 end
 
-local function getTowerUpgradeCost(towerName: string, nextLevel: number, recordedCost: number?): number
+local function getTowerUpgradeCost(towerName, nextLevel, recordedCost)
     if recordedCost and tonumber(recordedCost) and tonumber(recordedCost) > 0 then
         return tonumber(recordedCost)
     end
@@ -454,7 +445,7 @@ local function getTowerUpgradeCost(towerName: string, nextLevel: number, recorde
     return 200
 end
 
-local function resolveUnitIdForTower(towerName: string, fallbackId: string?): string
+local function resolveUnitIdForTower(towerName, fallbackId)
     for slot = 1, 5 do
         local sName = LP:GetAttribute("Slot" .. slot)
         local sId = LP:GetAttribute("Slot" .. slot .. "Id")
@@ -462,14 +453,12 @@ local function resolveUnitIdForTower(towerName: string, fallbackId: string?): st
             return sId
         end
     end
-
     local foundId = nil
     pcall(function()
-        local repMod = RS:FindFirstChild("ModuleLoader")
-            and RS.ModuleLoader:FindFirstChild("Client")
-            and RS.ModuleLoader.Client:FindFirstChild("Replication")
-        if repMod then
-            local rep = require(repMod).GetCurrentReplica()
+        local repMod = (shared and shared.Modules and shared.Modules.Replication)
+            or (RS:FindFirstChild("ModuleLoader") and RS.ModuleLoader:FindFirstChild("Client") and RS.ModuleLoader.Client:FindFirstChild("Replication") and require(RS.ModuleLoader.Client.Replication))
+        if repMod and repMod.GetCurrentReplica then
+            local rep = repMod.GetCurrentReplica()
             if rep and rep.Data and rep.Data.Towers then
                 for id, data in pairs(rep.Data.Towers) do
                     if data.Name == towerName and data.Equipped then
@@ -480,12 +469,10 @@ local function resolveUnitIdForTower(towerName: string, fallbackId: string?): st
             end
         end
     end)
-    if foundId then return foundId end
-
-    return fallbackId or "1"
+    return foundId or fallbackId or "1"
 end
 
--- ==================== RECORDING & REPLAY STATE ====================
+-- ==================== 8. RECORDING & REPLAY ENGINE ====================
 local recData = { version = 4.7, actions = {} }
 local TowerIdToPlacementIndex = {}
 local recordedTowerLevels = {}
@@ -499,7 +486,6 @@ local ReplayTowers = {}
 local ActiveTowerLevels = {}
 local ActiveTowerModes = {}
 
--- ==================== SINGLETON NAMECALL HOOK ====================
 ENV.__CAM_TD_HOOK_CB = function(payload)
     if not S.recording then return end
     if type(payload) == "table" and payload.Name then
@@ -507,9 +493,7 @@ ENV.__CAM_TD_HOOK_CB = function(payload)
         local now = tick()
         local pos = payload.Pos or (payload.CFrame and payload.CFrame.Position)
         if pos then
-            if (now - lastPlaceTime < 0.35) and (getDistanceXZ(lastPlacePos, pos) < 1.0) then
-                return
-            end
+            if (now - lastPlaceTime < 0.35) and (getDistanceXZ(lastPlacePos, pos) < 1.0) then return end
             lastPlaceTime = now
             lastPlacePos = pos
         end
@@ -524,16 +508,13 @@ if not ENV.__CAM_TD_NAMECALL_HOOKED and hookmetamethod and getnamecallmethod the
         if not checkcaller() and typeof(self) == "Instance" and (method == "FireServer" or method == "fireServer") then
             if self.Name == "TowerAdd" and ENV.__CAM_TD_HOOK_CB then
                 local args = { ... }
-                task.spawn(function()
-                    pcall(ENV.__CAM_TD_HOOK_CB, args[1])
-                end)
+                task.spawn(function() pcall(ENV.__CAM_TD_HOOK_CB, args[1]) end)
             end
         end
         return oldNamecall(self, ...)
     end))
 end
 
--- ==================== REMOTE EVENT BINDINGS ====================
 local function bindRemoteListeners()
     if Remotes.TowerAdd then
         trackConn(Remotes.TowerAdd.OnClientEvent:Connect(function(data)
@@ -544,7 +525,7 @@ local function bindRemoteListeners()
             local tId = tostring(data.Id)
             local tName = tostring(data.Name or "Tower")
             local pos = data.Pos
-            local rawCf = data.CFrame or (pos and CFrame.new(pos)) or CFrame.identity
+            local rawCf = data.CFrame or CFrame.new(pos)
             local _, yawRad, _ = rawCf:ToOrientation()
             local cf = CFrame.new(pos) * CFrame.Angles(0, yawRad, 0)
 
@@ -554,7 +535,6 @@ local function bindRemoteListeners()
                 local liveCost = (data.Stats and tonumber(data.Stats.Price)) or getTowerPlacementCost(tName)
                 TowerIdToPlacementIndex[tId] = newIdx
                 recordedTowerLevels[tId] = 1
-
                 table.insert(recData.actions, {
                     type = "place",
                     placementIndex = newIdx,
@@ -590,18 +570,13 @@ local function bindRemoteListeners()
             if not data or not data.Id then return end
             local tId = tostring(data.Id)
             local lvl = tonumber(data.Level)
-
-            if S.replaying and lvl then
-                ActiveTowerLevels[tId] = lvl
-            end
+            if S.replaying and lvl then ActiveTowerLevels[tId] = lvl end
 
             if S.recording then
                 local pIdx = TowerIdToPlacementIndex[tId]
                 if not pIdx then return end
-
                 local newLvl = lvl or ((recordedTowerLevels[tId] or 1) + 1)
                 local lastLvl = recordedTowerLevels[tId] or 1
-
                 if newLvl > lastLvl then
                     recordedTowerLevels[tId] = newLvl
                     local towerName = "Unknown"
@@ -611,7 +586,6 @@ local function bindRemoteListeners()
                             break
                         end
                     end
-
                     local upgCost = getTowerUpgradeCost(towerName, newLvl)
                     table.insert(recData.actions, {
                         type = "upgrade",
@@ -634,15 +608,10 @@ local function bindRemoteListeners()
             if not S.recording then return end
             local tId = data and (data.Id and tostring(data.Id) or (data.Index and tostring(data.Index)))
             if not tId then return end
-
             local pIdx = TowerIdToPlacementIndex[tId]
             if pIdx and not recordedSoldTowers[tId] then
                 recordedSoldTowers[tId] = true
-                table.insert(recData.actions, {
-                    type = "sell",
-                    placementIndex = pIdx,
-                    towerId = tId
-                })
+                table.insert(recData.actions, { type = "sell", placementIndex = pIdx, towerId = tId })
                 timelineDirty = true
                 addLog(string.format("🗑 [REC] Sold Unit #%d", pIdx), C.Bad)
             end
@@ -655,7 +624,6 @@ local function bindRemoteListeners()
             local tId = tostring(data.Id)
             local newMode = tostring(data.TargetMode)
             ActiveTowerModes[tId] = newMode
-
             if S.recording then
                 local pIdx = TowerIdToPlacementIndex[tId]
                 if pIdx and (recordedTowerModes[tId] ~= newMode) then
@@ -674,34 +642,27 @@ local function bindRemoteListeners()
     end
 end
 
--- ==================== REPLAY ENGINE ====================
-local function findPlacedTowerModelByPos(targetPos: Vector3, maxDist: number?): Instance?
+local function findPlacedTowerModelByPos(targetPos, maxDist)
     if not towersFolder then
         gameFolder = workspace:FindFirstChild("Game")
         towersFolder = gameFolder and gameFolder:FindFirstChild("Towers")
     end
     if not towersFolder then return nil end
-
     local threshold = maxDist or 2.8
     local closestModel, closestDist = nil, 999999
-
     for _, child in ipairs(towersFolder:GetChildren()) do
         if child:IsA("Model") then
-            local pivot = child:GetPivot().Position
-            local dist = getDistanceXZ(pivot, targetPos)
+            local dist = getDistanceXZ(child:GetPivot().Position, targetPos)
             if dist < closestDist then
                 closestDist = dist
                 closestModel = child
             end
         end
     end
-    if closestDist <= threshold then
-        return closestModel
-    end
-    return nil
+    return (closestDist <= threshold) and closestModel or nil
 end
 
-local function awaitCashAndPause(cost: number, sL: any, actionDesc: string): string
+local function awaitCashAndPause(cost, sL, actionDesc)
     while Controller.Running and S.replaying and isMatchActive() do
         if S.skipCurrentStep then
             S.skipCurrentStep = false
@@ -728,7 +689,7 @@ local function awaitCashAndPause(cost: number, sL: any, actionDesc: string): str
     return "ABORT"
 end
 
-local function executeReplay(macroData: table, sL: any)
+local function executeReplay(macroData, sL)
     if S.replaying then return end
     if not macroData or not macroData.actions or #macroData.actions == 0 then
         addLog("❌ Replay aborted: Macro has 0 actions.", C.Bad)
@@ -781,14 +742,11 @@ local function executeReplay(macroData: table, sL: any)
             sL.TextColor3 = C.Acc
         end
 
-        -- 1. PLACE
         if a.type == "place" then
             local targetPos = Vector3.new(a.pos[1], a.pos[2], a.pos[3])
             local yawRad = 0
             if a.cframe and #a.cframe == 12 then
-                local okCf, parsedCf = pcall(function()
-                    return CFrame.new(unpack(a.cframe))
-                end)
+                local okCf, parsedCf = pcall(function() return CFrame.new(unpack(a.cframe)) end)
                 if okCf and parsedCf then
                     local _, y, _ = parsedCf:ToOrientation()
                     yawRad = y
@@ -800,44 +758,27 @@ local function executeReplay(macroData: table, sL: any)
             if existing then
                 ReplayTowers[a.placementIndex] = existing.Name
                 ActiveTowerLevels[existing.Name] = ActiveTowerLevels[existing.Name] or 1
-                addLog(string.format("⏭ Unit #%d (%s) already on field", a.placementIndex, a.towerName), C.Dim)
                 continue
             end
 
             local cost = getTowerPlacementCost(a.towerName, a.cost)
             local status = awaitCashAndPause(cost, sL, "Place " .. a.towerName)
             if status == "ABORT" then break end
-            if status == "SKIP" then
-                addLog(string.format("⏭ Skipped Step #%d (%s)", i, stepSummary), C.Gold)
-                continue
-            end
+            if status == "SKIP" then continue end
 
             local unitId = resolveUnitIdForTower(a.towerName, a.unitId)
-            local placed = false
-            local attempts = 0
+            local placed, attempts = false, 0
 
             while not placed and attempts < 10 and S.replaying and isMatchActive() and Controller.Running do
-                if S.skipCurrentStep then
-                    S.skipCurrentStep = false
-                    break
-                end
+                if S.skipCurrentStep then S.skipCurrentStep = false break end
                 if Remotes.TowerAdd then
                     pcall(function()
-                        Remotes.TowerAdd:FireServer({
-                            Name = a.towerName,
-                            UnitId = unitId,
-                            Pos = targetPos,
-                            CFrame = cf
-                        })
+                        Remotes.TowerAdd:FireServer({ Name = a.towerName, UnitId = unitId, Pos = targetPos, CFrame = cf })
                     end)
                 end
-
                 local startWait = tick()
                 while tick() - startWait < 1.4 and S.replaying and isMatchActive() do
-                    if ReplayTowers[a.placementIndex] then
-                        placed = true
-                        break
-                    end
+                    if ReplayTowers[a.placementIndex] then placed = true break end
                     local found = findPlacedTowerModelByPos(targetPos, 2.8)
                     if found then
                         ReplayTowers[a.placementIndex] = found.Name
@@ -849,24 +790,20 @@ local function executeReplay(macroData: table, sL: any)
                 end
                 attempts += 1
             end
-
             if placed then
                 addLog(string.format("📍 Placed: %s (#%d)", a.towerName, a.placementIndex), C.Ok)
             else
-                addLog(string.format("❌ Place Failed/Skipped: %s (#%d)", a.towerName, a.placementIndex), C.Bad)
+                addLog(string.format("❌ Place Failed: %s (#%d)", a.towerName, a.placementIndex), C.Bad)
             end
             task.wait(0.1)
 
-        -- 2. UPGRADE
         elseif a.type == "upgrade" then
             local tId = ReplayTowers[a.placementIndex]
             local model = tId and towersFolder and towersFolder:FindFirstChild(tId)
-
             if not model then
                 for _, prevAct in ipairs(macroData.actions) do
                     if prevAct.type == "place" and prevAct.placementIndex == a.placementIndex and prevAct.pos then
-                        local pPos = Vector3.new(prevAct.pos[1], prevAct.pos[2], prevAct.pos[3])
-                        model = findPlacedTowerModelByPos(pPos, 2.8)
+                        model = findPlacedTowerModelByPos(Vector3.new(prevAct.pos[1], prevAct.pos[2], prevAct.pos[3]), 2.8)
                         if model then
                             tId = model.Name
                             ReplayTowers[a.placementIndex] = tId
@@ -887,78 +824,47 @@ local function executeReplay(macroData: table, sL: any)
                     end
                 end
                 towerName = towerName or "Scientist Cameraman"
-
                 local currentLvl = ActiveTowerLevels[tId] or 1
                 local targetLvl = a.targetLevel or (currentLvl + 1)
-
-                if currentLvl >= targetLvl then
-                    addLog(string.format("⏭ Unit #%d already Lvl %d", a.placementIndex, currentLvl), C.Dim)
-                    continue
-                end
+                if currentLvl >= targetLvl then continue end
 
                 local cost = getTowerUpgradeCost(towerName, targetLvl, a.cost)
                 local status = awaitCashAndPause(cost, sL, string.format("Upg #%d -> Lvl %d", a.placementIndex, targetLvl))
                 if status == "ABORT" then break end
-                if status == "SKIP" then
-                    addLog(string.format("⏭ Skipped Step #%d (%s)", i, stepSummary), C.Gold)
-                    continue
-                end
+                if status == "SKIP" then continue end
 
-                local upgraded = false
-                local attempts = 0
-
+                local upgraded, attempts = false, 0
                 while not upgraded and attempts < 6 and S.replaying and isMatchActive() and Controller.Running do
-                    if S.skipCurrentStep then
-                        S.skipCurrentStep = false
-                        break
-                    end
-                    pcall(function()
-                        Remotes.TowerUpgrade:FireServer({ Id = tId })
-                    end)
-
+                    if S.skipCurrentStep then S.skipCurrentStep = false break end
+                    pcall(function() Remotes.TowerUpgrade:FireServer({ Id = tId }) end)
                     local waitStart = tick()
                     while tick() - waitStart < 1.8 and S.replaying and isMatchActive() do
-                        if (ActiveTowerLevels[tId] or 1) >= targetLvl then
-                            upgraded = true
-                            break
-                        end
+                        if (ActiveTowerLevels[tId] or 1) >= targetLvl then upgraded = true break end
                         task.wait(0.05)
                     end
-
                     if not upgraded and getCash() < (cost - 10) then
                         local graceStart = tick()
                         while tick() - graceStart < 2.5 and S.replaying do
-                            if (ActiveTowerLevels[tId] or 1) >= targetLvl then
-                                upgraded = true
-                                break
-                            end
+                            if (ActiveTowerLevels[tId] or 1) >= targetLvl then upgraded = true break end
                             task.wait(0.1)
                         end
                     end
                     attempts += 1
                 end
-
                 if upgraded then
                     ActiveTowerLevels[tId] = targetLvl
                     addLog(string.format("⬆ Upgraded: #%d (%s) -> Lvl %d", a.placementIndex, towerName, targetLvl), C.Acc)
-                else
-                    addLog(string.format("❌ Upgrade Failed: #%d -> Lvl %d", a.placementIndex, targetLvl), C.Bad)
                 end
-            else
-                addLog(string.format("⚠️ Unit #%d not found for upgrade", a.placementIndex), C.Gold)
             end
             task.wait(0.1)
 
-        -- 3. SELL
         elseif a.type == "sell" then
             local status = awaitCashAndPause(0, sL, "Sell #" .. tostring(a.placementIndex))
             if status == "ABORT" then break end
             if status ~= "SKIP" then
                 local tId = ReplayTowers[a.placementIndex]
                 if tId and Remotes.TowerSell then
-                    pcall(function()
-                        Remotes.TowerSell:FireServer({ Id = tId })
-                    end)
+                    pcall(function() Remotes.TowerSell:FireServer({ Id = tId }) end)
                     ReplayTowers[a.placementIndex] = nil
                     ActiveTowerLevels[tId] = nil
                     addLog(string.format("🗑 Sold Unit #%d", a.placementIndex), C.Bad)
@@ -966,16 +872,13 @@ local function executeReplay(macroData: table, sL: any)
             end
             task.wait(0.1)
 
-        -- 4. TARGET
         elseif a.type == "target" then
             local status = awaitCashAndPause(0, sL, "Target #" .. tostring(a.placementIndex))
             if status == "ABORT" then break end
             if status ~= "SKIP" then
                 local tId = ReplayTowers[a.placementIndex]
                 if tId and Remotes.TowerTarget then
-                    pcall(function()
-                        Remotes.TowerTarget:FireServer({ Id = tId })
-                    end)
+                    pcall(function() Remotes.TowerTarget:FireServer({ Id = tId }) end)
                     addLog(string.format("🎯 Target Mode #%d -> %s", a.placementIndex, tostring(a.targetMode)), C.Gold)
                 end
             end
@@ -995,16 +898,14 @@ local function executeReplay(macroData: table, sL: any)
     end
 end
 
--- ==================== TABBED UI ARCHITECTURE ====================
+-- ==================== 9. TABBED UI ARCHITECTURE ====================
 local gui = Instance.new("ScreenGui")
 gui.Name = "CameraTD_PrecisionV47"
 gui.ResetOnSpawn = false
 gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 
 local parentGui = nil
-if gethui then
-    pcall(function() parentGui = gethui() end)
-end
+if gethui then pcall(function() parentGui = gethui() end) end
 if not parentGui then
     local ok, core = pcall(game.GetService, game, "CoreGui")
     parentGui = (ok and core) or LP:WaitForChild("PlayerGui")
@@ -1068,7 +969,7 @@ subTitleLbl.TextSize = 8
 subTitleLbl.Font = Enum.Font.GothamMedium
 subTitleLbl.TextXAlignment = Enum.TextXAlignment.Left
 
-local function makeHeaderBtn(txt: string, xOff: number, col: Color3)
+local function makeHeaderBtn(txt, xOff, col)
     local b = Instance.new("TextButton", hdr)
     b.Size = UDim2.fromOffset(24, 22)
     b.Position = UDim2.new(1, xOff, 0.5, -11)
@@ -1134,10 +1035,9 @@ pagesFolder.Size = UDim2.new(1, -16, 1, -124)
 pagesFolder.Position = UDim2.fromOffset(8, 120)
 pagesFolder.BackgroundTransparency = 1
 
-local tabButtons = {}
-local tabPages = {}
+local tabButtons, tabPages = {}, {}
 
-local function createTab(name: string, order: number)
+local function createTab(name, order)
     local btn = Instance.new("TextButton", tabBar)
     btn.Size = UDim2.new(0.2, -3, 1, 0)
     btn.LayoutOrder = order
@@ -1176,7 +1076,6 @@ local function createTab(name: string, order: number)
             tabPages[tName].Visible = active
         end
     end)
-
     return page
 end
 
@@ -1192,7 +1091,7 @@ local function nextOrder()
     return orderCounter
 end
 
-local function mkSection(parent: Instance, title: string, height: number)
+local function mkSection(parent, title, height)
     local card = Instance.new("Frame", parent)
     card.Size = UDim2.new(1, 0, 0, height)
     card.BackgroundColor3 = C.Bg2
@@ -1213,7 +1112,7 @@ local function mkSection(parent: Instance, title: string, height: number)
     return card
 end
 
-local function mkButton(parent: Instance, text: string, xScale: number, yPos: number, wScale: number, h: number, col: Color3, cb: any?)
+local function mkButton(parent, text, xScale, yPos, wScale, h, col, cb)
     local b = Instance.new("TextButton", parent)
     b.Size = UDim2.new(wScale, -6, 0, h)
     b.Position = UDim2.new(xScale, 4, 0, yPos)
@@ -1223,13 +1122,11 @@ local function mkButton(parent: Instance, text: string, xScale: number, yPos: nu
     b.TextSize = 9
     b.Font = Enum.Font.GothamBold
     Instance.new("UICorner", b).CornerRadius = UDim.new(0, 5)
-    if cb then
-        b.Activated:Connect(cb)
-    end
+    if cb then b.Activated:Connect(cb) end
     return b
 end
 
-local function mkToggle(parent: Instance, label: string, yPos: number, key: string, cb: any?)
+local function mkToggle(parent, label, yPos, key, cb)
     local on = S[key] or false
     local row = Instance.new("TextButton", parent)
     row.Size = UDim2.new(1, -12, 0, 24)
@@ -1282,7 +1179,7 @@ local function mkToggle(parent: Instance, label: string, yPos: number, key: stri
     end)
 end
 
-local function mkCycler(parent: Instance, values: {any}, startIdx: number, yPos: number, onChange: any)
+local function mkCycler(parent, values, startIdx, yPos, onChange)
     local idx = math.clamp(startIdx or 1, 1, #values)
     local f = Instance.new("Frame", parent)
     f.Size = UDim2.new(1, -12, 0, 22)
@@ -1354,21 +1251,13 @@ nb.FocusLost:Connect(function()
     end
 end)
 
-local function syncMacroFromRec(name: string)
-    local cloned = table.clone(recData.actions)
-    S.macro = {
-        name = name,
-        date = os.date(),
-        actions = cloned
-    }
+local function syncMacroFromRec(name)
+    S.macro = { name = name, date = os.date(), actions = table.clone(recData.actions) }
     timelineDirty = true
 end
 
-local function saveCurrentMacro(name: string): boolean
-    if name == "" then
-        addLog("⚠️ Enter a macro name first!", C.Gold)
-        return false
-    end
+local function saveCurrentMacro(name)
+    if name == "" then return false end
     local actionsToSave = (#recData.actions > 0 and recData.actions) or (S.macro and S.macro.actions) or {}
     if #actionsToSave == 0 then
         addLog("⚠️ Cannot save an empty macro (0 actions).", C.Gold)
@@ -1377,25 +1266,17 @@ local function saveCurrentMacro(name: string): boolean
     S.macroName = name
     nb.Text = name
     saveS()
-    local payload = {
-        name = name,
-        date = os.date(),
-        actions = actionsToSave
-    }
+    local payload = { name = name, date = os.date(), actions = actionsToSave }
     S.macro = payload
     recData.actions = table.clone(actionsToSave)
     local ok = saveJSON(MACRO_FOLDER .. "/" .. name .. ".json", payload)
     fileListDirty = true
     timelineDirty = true
-    if ok then
-        addLog(string.format("💾 Saved '%s' (%d actions)", name, #actionsToSave), C.Ok)
-    else
-        addLog("❌ Failed to write file", C.Bad)
-    end
+    if ok then addLog(string.format("💾 Saved '%s' (%d actions)", name, #actionsToSave), C.Ok) end
     return ok
 end
 
-local function loadMacroByName(name: string): boolean
+local function loadMacroByName(name)
     if name == "" then return false end
     local d = loadJSON(MACRO_FOLDER .. "/" .. name .. ".json")
     if d and type(d.actions) == "table" then
@@ -1408,10 +1289,8 @@ local function loadMacroByName(name: string): boolean
         fileListDirty = true
         addLog(string.format("📂 Loaded '%s' (%d actions)", name, #d.actions), C.Ok)
         return true
-    else
-        addLog("❌ Macro file not found: " .. name, C.Bad)
-        return false
     end
+    return false
 end
 
 local g_recB = mkButton(ctrlCard, "⏺ RECORD", 0, 46, 0.5, 22, C.Bad)
@@ -1420,10 +1299,7 @@ g_stpB.Visible = false
 
 g_recB.Activated:Connect(function()
     if S.recording then return end
-    if S.replaying then
-        S.replaying = false
-        task.wait(0.1)
-    end
+    if S.replaying then S.replaying = false task.wait(0.1) end
     table.clear(TowerIdToPlacementIndex)
     table.clear(recordedTowerLevels)
     table.clear(recordedSoldTowers)
@@ -1473,19 +1349,11 @@ local g_repB = mkButton(ctrlCard, "▶ REPLAY", 0.5, 46, 0.5, 22, C.Acc, functio
         addLog("❌ No macro actions loaded to replay!", C.Bad)
         return
     end
-    task.spawn(function()
-        executeReplay(d, statusLabel)
-    end)
+    task.spawn(function() executeReplay(d, statusLabel) end)
 end)
 
-mkButton(ctrlCard, "💾 SAVE", 0, 72, 0.333, 20, C.Ok, function()
-    saveCurrentMacro(nb.Text)
-end)
-
-mkButton(ctrlCard, "📂 LOAD", 0.333, 72, 0.333, 20, C.AccDim, function()
-    loadMacroByName(nb.Text)
-end)
-
+mkButton(ctrlCard, "💾 SAVE", 0, 72, 0.333, 20, C.Ok, function() saveCurrentMacro(nb.Text) end)
+mkButton(ctrlCard, "📂 LOAD", 0.333, 72, 0.333, 20, C.AccDim, function() loadMacroByName(nb.Text) end)
 mkButton(ctrlCard, "🗑 DELETE", 0.666, 72, 0.334, 20, C.Bad, function()
     local n = nb.Text
     if n == "" then return end
@@ -1501,22 +1369,16 @@ end)
 local g_pauseB = mkButton(ctrlCard, "⏸ PAUSE", 0, 96, 0.333, 20, C.Bg3, function()
     if not S.replaying then return end
     S.paused = not S.paused
-    addLog(S.paused and "⏸ Replay Paused" or "▶ Replay Resumed", C.Gold)
 end)
-
 mkButton(ctrlCard, "⏭ SKIP STEP", 0.333, 96, 0.333, 20, C.Bg3, function()
-    if S.replaying then
-        S.skipCurrentStep = true
-    end
+    if S.replaying then S.skipCurrentStep = true end
 end)
-
 mkButton(ctrlCard, "↩ UNDO ACT", 0.666, 96, 0.334, 20, C.Bg3, function()
     local targetList = (#recData.actions > 0 and recData.actions) or (S.macro and S.macro.actions)
     if targetList and #targetList > 0 then
-        local removed = table.remove(targetList)
+        table.remove(targetList)
         syncMacroFromRec(nb.Text)
         timelineDirty = true
-        addLog("↩ Removed last action: " .. tostring(removed and removed.type or "?"), C.Gold)
     end
 end)
 
@@ -1531,9 +1393,7 @@ actCountLbl.TextXAlignment = Enum.TextXAlignment.Left
 actCountLbl.Text = "Loaded: None (0 Actions) | Step: 0/0"
 
 local filesCard = mkSection(pageMacro, "Saved Macro Profiles (Click to Load)", 92)
-local refreshFilesBtn = mkButton(filesCard, "↻ Refresh", 0.76, 2, 0.24, 15, C.Bg3, function()
-    fileListDirty = true
-end)
+local refreshFilesBtn = mkButton(filesCard, "↻ Refresh", 0.76, 2, 0.24, 15, C.Bg3, function() fileListDirty = true end)
 refreshFilesBtn.TextSize = 7
 
 local filesScroll = Instance.new("ScrollingFrame", filesCard)
@@ -1551,7 +1411,6 @@ local clearActsBtn = mkButton(timelineCard, "Clear All", 0.76, 2, 0.24, 15, C.Ba
     recData.actions = {}
     if S.macro then S.macro.actions = {} end
     timelineDirty = true
-    addLog("🧹 Cleared current macro actions in memory.", C.Gold)
 end)
 clearActsBtn.TextSize = 7
 
@@ -1565,7 +1424,7 @@ timelineScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
 timelineScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
 Instance.new("UICorner", timelineScroll).CornerRadius = UDim.new(0, 5)
 
--- ==================== TAB 2: MATCH AUTOMATION & STOP-SKIP ====================
+-- ==================== TAB 2: MATCH AUTOMATION ====================
 local skipCard = mkSection(pageAuto, "Smart Wave-Skip Filter (Multi-Account)", 128)
 mkToggle(skipCard, "Auto Skip Wave (Instant)", 20, "autoSkip")
 
@@ -1573,7 +1432,7 @@ local skipHint = Instance.new("TextLabel", skipCard)
 skipHint.Size = UDim2.new(1, -12, 0, 14)
 skipHint.Position = UDim2.fromOffset(8, 46)
 skipHint.BackgroundTransparency = 1
-skipHint.Text = "Stop Skip Waves (e.g. 5-15, 16, 17 or 5, 15):"
+skipHint.Text = "Stop Skip Waves (e.g. 5-15, 16, 17 or 49):"
 skipHint.TextColor3 = C.Dim
 skipHint.TextSize = 8
 skipHint.Font = Enum.Font.GothamBold
@@ -1595,7 +1454,6 @@ Instance.new("UICorner", skipBox).CornerRadius = UDim.new(0, 5)
 skipBox.FocusLost:Connect(function()
     S.noSkipWaves = skipBox.Text:match("^%s*(.-)%s*$") or ""
     saveS()
-    addLog("🛑 No-Skip Waves set to: " .. (S.noSkipWaves ~= "" and S.noSkipWaves or "None (Skip All)"), C.Gold)
 end)
 
 mkToggle(skipCard, "Sync No-Skip Waves Across All Accounts", 90, "syncSkipMultiAcc", function(on)
@@ -1611,7 +1469,6 @@ local spIdx = table.find(speedVals, S.speedChoice) or 3
 mkCycler(autoCard, speeds, spIdx, 48, function(_, idx)
     S.speedChoice = speedVals[idx]
     saveS()
-    addLog("⚡ Speed Lock: " .. S.speedChoice .. "x", C.Acc)
 end)
 
 mkToggle(autoCard, "Auto Vote Gamemode", 76, "autoVoteMode")
@@ -1620,7 +1477,6 @@ local mIdx = table.find(modes, S.selectedMode) or 4
 mkCycler(autoCard, modes, mIdx, 104, function(val)
     S.selectedMode = val
     saveS()
-    addLog("🗳️ Target Mode: " .. val, C.Acc)
 end)
 
 mkToggle(autoCard, "Auto Replay (Play Again)", 132, "autoReplay")
@@ -1630,9 +1486,7 @@ mkToggle(autoCard, "Auto Play Macro On Wave 1", 160, "autoPlay")
 local execCard = mkSection(pageExec, "Auto-Execute & Startup Delay", 124)
 
 mkToggle(execCard, "Auto Execute Script", 20, "autoExecute", function(on)
-    if on then
-        setupAutoExecute(true)
-    end
+    if on then armAutoExecute(true) end
 end)
 
 local delayHint = Instance.new("TextLabel", execCard)
@@ -1671,7 +1525,7 @@ mkButton(execCard, "⚡ Auto Execute Script", 0, 92, 1, 24, C.AccDim, function()
     S.autoExecute = true
     S.teleportQueued = false
     saveS()
-    setupAutoExecute(true)
+    armAutoExecute(true)
 end)
 
 local scaleCard = mkSection(pageExec, "Phone UI Size", 78)
@@ -1679,12 +1533,11 @@ mkToggle(scaleCard, "Auto-Fit UI Scale To Phone Screen", 20, "autoScaleUI", func
     updateAdaptiveScale()
 end)
 
-local function setManualScale(sc: number)
+local function setManualScale(sc)
     S.autoScaleUI = false
     S.uiScale = sc
     saveS()
     updateAdaptiveScale()
-    addLog(string.format("📱 UI Size: %d%%", math.round(sc * 100)), C.Acc)
 end
 
 mkButton(scaleCard, "70%", 0, 48, 0.25, 20, C.Bg3, function() setManualScale(0.70) end)
@@ -1714,13 +1567,12 @@ local slStroke = Instance.new("UIStroke", sliderBar)
 slStroke.Color = C.Stroke
 
 local sliderFill = Instance.new("Frame", sliderBar)
-local curRel = math.clamp((S.fpsCap - 5) / 139, 0, 1)
-sliderFill.Size = UDim2.new(curRel, 0, 1, 0)
+sliderFill.Size = UDim2.new(math.clamp((S.fpsCap - 5) / 139, 0, 1), 0, 1, 0)
 sliderFill.BackgroundColor3 = C.Acc
 Instance.new("UICorner", sliderFill).CornerRadius = UDim.new(1, 0)
 
 local draggingSlider = false
-local function updateSlider(xPos: number)
+local function updateSlider(xPos)
     local barX = sliderBar.AbsolutePosition.X
     local barW = math.max(sliderBar.AbsoluteSize.X, 1)
     local rel = math.clamp((xPos - barX) / barW, 0, 1)
@@ -1749,7 +1601,7 @@ trackConn(UserInputService.InputEnded:Connect(function(input)
     end
 end))
 
-local function setPresetFPS(fps: number)
+local function setPresetFPS(fps)
     S.fpsCap = fps
     saveS()
     applyFPSCap(fps)
@@ -1828,9 +1680,7 @@ function Controller.Unload()
         pcall(function() c:Disconnect() end)
     end
     table.clear(Controller.Connections)
-    if gui and gui.Parent then
-        gui:Destroy()
-    end
+    if gui and gui.Parent then gui:Destroy() end
 end
 
 clsB.Activated:Connect(Controller.Unload)
@@ -1871,10 +1721,7 @@ local function renderMacroFileList()
         row.Font = Enum.Font.GothamBold
         row.TextXAlignment = Enum.TextXAlignment.Left
         Instance.new("UICorner", row).CornerRadius = UDim.new(0, 4)
-
-        row.Activated:Connect(function()
-            loadMacroByName(fName)
-        end)
+        row.Activated:Connect(function() loadMacroByName(fName) end)
     end
 end
 
@@ -1901,20 +1748,15 @@ local function renderActionTimeline()
         return
     end
 
-    local maxShow = math.min(#actions, 60)
-    for i = 1, maxShow do
+    for i = 1, math.min(#actions, 60) do
         local a = actions[i]
         local isCurrent = (S.replaying and S.currentStepIndex == i)
-        local desc = ""
-        local col = C.Dim
-
+        local desc, col = "", C.Dim
         if a.type == "place" then
-            local c = getTowerPlacementCost(a.towerName, a.cost)
-            desc = string.format("[%d] PLACE #%d: %s ($%d)", i, a.placementIndex or i, tostring(a.towerName), c)
+            desc = string.format("[%d] PLACE #%d: %s ($%d)", i, a.placementIndex or i, tostring(a.towerName), getTowerPlacementCost(a.towerName, a.cost))
             col = C.Ok
         elseif a.type == "upgrade" then
-            local c = getTowerUpgradeCost(a.towerName or "", a.targetLevel or 2, a.cost)
-            desc = string.format("[%d] UPGRADE #%d -> Lvl %d ($%d)", i, a.placementIndex or 0, a.targetLevel or 2, c)
+            desc = string.format("[%d] UPGRADE #%d -> Lvl %d ($%d)", i, a.placementIndex or 0, a.targetLevel or 2, getTowerUpgradeCost(a.towerName or "", a.targetLevel or 2, a.cost))
             col = C.Acc
         elseif a.type == "sell" then
             desc = string.format("[%d] SELL Unit #%d", i, a.placementIndex or 0)
@@ -1923,7 +1765,6 @@ local function renderActionTimeline()
             desc = string.format("[%d] TARGET #%d -> %s", i, a.placementIndex or 0, tostring(a.targetMode))
             col = C.Gold
         end
-
         local item = Instance.new("TextLabel", timelineScroll)
         item.Size = UDim2.new(1, 0, 0, 14)
         item.LayoutOrder = i
@@ -1938,17 +1779,12 @@ local function renderActionTimeline()
     end
 end
 
--- ==================== ASYNC ENGINE LINKER (ORIGINAL v4.7) ====================
+-- ==================== 10. ASYNC ENGINE LINKER ====================
 task.spawn(function()
     addLog("⏳ Initializing Camera TD Precision Engine...", C.Acc)
-
     pcall(function() loadMacroByName(S.macroName) end)
     pcall(renderMacroFileList)
     pcall(renderActionTimeline)
-
-    if S.autoExecute then
-        setupAutoExecute(false)
-    end
 
     while Controller.Running and not EngineReady do
         playerGui = LP:FindFirstChildOfClass("PlayerGui")
@@ -1986,9 +1822,7 @@ task.spawn(function()
                 end)
 
                 bindRemoteListeners()
-                if S.disableVFX then
-                    applyVFXSetting(true)
-                end
+                if S.disableVFX then applyVFXSetting(true) end
                 EngineReady = true
                 subTitleLbl.Text = "✅ Engine Linked | R-Ctrl or — to Minimize"
                 subTitleLbl.TextColor3 = C.Ok
@@ -2000,9 +1834,11 @@ task.spawn(function()
     end
 end)
 
--- ==================== CENTRAL SUPERVISOR LOOP ====================
+-- ==================== 11. CENTRAL SUPERVISOR LOOP ====================
 task.spawn(function()
     local lastBlockedWaveLog = 0
+    local lastPlayAgainAttempt = 0
+
     while Controller.Running and gui.Parent do
         local isOver = isGameOver()
         local isVoting = isVotingActive()
@@ -2026,9 +1862,7 @@ task.spawn(function()
             if S.autoSpeed and isPlaying and Remotes.ChangeSpeed then
                 local curSpeed = workspace:GetAttribute("GameSpeed")
                 if curSpeed ~= S.speedChoice then
-                    pcall(function()
-                        Remotes.ChangeSpeed:InvokeServer(S.speedChoice)
-                    end)
+                    pcall(function() Remotes.ChangeSpeed:InvokeServer(S.speedChoice) end)
                 end
             end
 
@@ -2037,22 +1871,18 @@ task.spawn(function()
                 local votersRaw = workspace:GetAttribute(S.selectedMode .. "Voters")
                 local alreadyVoted = false
                 if votersRaw and votersRaw ~= "" then
-                    local ok, voters = pcall(function()
-                        return HttpService:JSONDecode(votersRaw)
-                    end)
+                    local ok, voters = pcall(function() return HttpService:JSONDecode(votersRaw) end)
                     if ok and type(voters) == "table" and table.find(voters, LP.UserId) then
                         alreadyVoted = true
                     end
                 end
                 if not alreadyVoted then
-                    pcall(function()
-                        Remotes.ModeVote:FireServer(S.selectedMode)
-                    end)
+                    pcall(function() Remotes.ModeVote:FireServer(S.selectedMode) end)
                     addLog("🗳️ Voted Mode: " .. S.selectedMode, C.Ok)
                 end
             end
 
-            -- 3. Wave Skip Enforcer (with Stop-Skip Wave Filter)
+            -- 3. Wave Skip Enforcer
             if S.autoSkip and isPlaying and Remotes.WaveSkip then
                 if workspace:GetAttribute("CanSkip") == true then
                     if isWaveSkipBlocked(curWave, S.noSkipWaves) then
@@ -2061,24 +1891,23 @@ task.spawn(function()
                             addLog(string.format("🛑 Auto-Skip paused on Wave %d (Filter: %s)", curWave, S.noSkipWaves), C.Gold)
                         end
                     else
-                        pcall(function()
-                            Remotes.WaveSkip:FireServer()
-                        end)
+                        pcall(function() Remotes.WaveSkip:FireServer() end)
                     end
                 end
             end
 
-            -- 4. Auto Play Again
+            -- 4. Verified Auto Play Again (Checks PlayAgainVoters so it never cancels or misses)
             if isOver then
-                if not S.hasVotedReplay and S.autoReplay and Remotes.PlayAgain then
-                    S.hasVotedReplay = true
-                    pcall(function()
-                        Remotes.PlayAgain:FireServer()
-                    end)
-                    addLog("⚡ [AutoReplay] Fired PlayAgain Vote!", C.Ok)
+                if S.autoExecute and not S.teleportQueued then
+                    armAutoExecute(false)
                 end
-            else
-                S.hasVotedReplay = false
+                if S.autoReplay and Remotes.PlayAgain and not hasVotedPlayAgain() then
+                    if tick() - lastPlayAgainAttempt >= 1.0 then
+                        lastPlayAgainAttempt = tick()
+                        pcall(function() Remotes.PlayAgain:FireServer() end)
+                        addLog("⚡ [AutoReplay] Sent PlayAgain Vote!", C.Ok)
+                    end
+                end
             end
 
             -- 5. Interruption Watchdog
@@ -2091,7 +1920,7 @@ task.spawn(function()
                 addLog("⏹ Replay Reset: Match transitioned to Voting/Lobby.", C.Gold)
             end
 
-            -- 6. AutoPlay Trigger (Strictly gated to Wave >= 1)
+            -- 6. AutoPlay Trigger on Wave >= 1
             if S.autoPlay and isPlaying and curWave >= 1 and not S.replaying and not S.recording and not S.macroPlayed then
                 S.macroPlayed = true
                 task.spawn(function()
@@ -2125,7 +1954,7 @@ task.spawn(function()
 
         if not S.replaying and not S.recording then
             if isOver then
-                statusLabel.Text = "🏁 Match Concluded (Waiting for Replay...)"
+                statusLabel.Text = hasVotedPlayAgain() and "🏁 Play Again Voted! Waiting..." or "🏁 Match Concluded (Voting Play Again...)"
                 statusLabel.TextColor3 = C.Gold
             elseif isVoting then
                 statusLabel.Text = "🗳️ Voting Gamemode (" .. S.selectedMode .. ")"
@@ -2147,15 +1976,8 @@ task.spawn(function()
         g_pauseB.Text = S.paused and "▶ RESUME" or "⏸ PAUSE"
         g_pauseB.BackgroundColor3 = S.paused and C.Gold or C.Bg3
 
-        if fileListDirty then
-            fileListDirty = false
-            pcall(renderMacroFileList)
-        end
-
-        if timelineDirty then
-            timelineDirty = false
-            pcall(renderActionTimeline)
-        end
+        if fileListDirty then fileListDirty = false pcall(renderMacroFileList) end
+        if timelineDirty then timelineDirty = false pcall(renderActionTimeline) end
 
         if logDirty then
             logDirty = false
