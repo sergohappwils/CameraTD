@@ -1,0 +1,2185 @@
+-- ====================================================================
+-- CAMERA TD // PRECISION ENGINE v4.7.1 (ORIGINAL ENGINE + 7s AUTO-EXEC)
+-- PlaceId: 114068177100380 | Live Config Prices | Smart Wave-Skip Filter
+-- ====================================================================
+
+if not game:IsLoaded() then
+    game.Loaded:Wait()
+end
+
+-- ==================== SAVED 7-SECOND STARTUP DELAY ====================
+local FOLDER = "CameraTD_Macro"
+local DELAY_FILE = FOLDER .. "/startup_delay.txt"
+local AUTOEXEC_FILE = FOLDER .. "/autoexec_cache.luau"
+
+local bootDelay = 7
+pcall(function()
+    if isfile and readfile and isfile(DELAY_FILE) then
+        local num = tonumber(readfile(DELAY_FILE))
+        if num and num >= 1 and num <= 60 then
+            bootDelay = num
+        end
+    end
+end)
+
+wait(bootDelay)
+
+-- ==================== SINGLETON CLEANUP GUARD ====================
+local ENV = (getgenv and getgenv()) or _G
+if ENV.__CAM_TD_CONTROLLER then
+    pcall(function()
+        ENV.__CAM_TD_CONTROLLER.Unload()
+    end)
+    task.wait(0.15)
+end
+
+local Controller = {
+    Running = true,
+    Connections = {}
+}
+ENV.__CAM_TD_CONTROLLER = Controller
+_G.__CAM_TD_MACRO = true
+
+local function trackConn(conn: RBXScriptConnection?): RBXScriptConnection?
+    if conn then
+        table.insert(Controller.Connections, conn)
+    end
+    return conn
+end
+
+-- ==================== SERVICES ====================
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local VirtualUser = nil
+pcall(function()
+    VirtualUser = game:GetService("VirtualUser")
+end)
+
+local LP = Players.LocalPlayer or Players.PlayerAdded:Wait()
+
+-- ==================== DIRECTORIES & PERSISTENCE ====================
+local MACRO_FOLDER = FOLDER .. "/macros"
+local SETTINGS_FILE = FOLDER .. "/" .. LP.Name .. "_settings.json"
+local SHARED_SKIP_FILE = FOLDER .. "/shared_skip_waves.txt"
+local LOG_FILE = FOLDER .. "/" .. LP.Name .. "_log.txt"
+
+local function ensureFolders()
+    pcall(function()
+        if makefolder and isfolder then
+            if not isfolder(FOLDER) then makefolder(FOLDER) end
+            if not isfolder(MACRO_FOLDER) then makefolder(MACRO_FOLDER) end
+        end
+    end)
+end
+ensureFolders()
+
+local function saveJSON(path: string, data: any): boolean
+    local ok = false
+    pcall(function()
+        if writefile then
+            ensureFolders()
+            writefile(path, HttpService:JSONEncode(data))
+            ok = true
+        end
+    end)
+    return ok
+end
+
+local function loadJSON(path: string): any
+    if not isfile or not readfile then return nil end
+    local exists = false
+    pcall(function() exists = isfile(path) end)
+    if not exists then return nil end
+    local ok, res = pcall(function()
+        return HttpService:JSONDecode(readfile(path))
+    end)
+    return (ok and type(res) == "table") and res or nil
+end
+
+local function listMacroFiles(): {string}
+    local names = {}
+    local seen = {}
+    pcall(function()
+        if listfiles and isfolder and isfolder(MACRO_FOLDER) then
+            for _, file in ipairs(listfiles(MACRO_FOLDER)) do
+                local normalized = tostring(file):gsub("\\", "/")
+                local name = normalized:match("([^/]+)%.json$")
+                if name and not seen[name] then
+                    seen[name] = true
+                    table.insert(names, name)
+                end
+            end
+        end
+    end)
+    table.sort(names)
+    return names
+end
+
+local DEFAULTS = {
+    autoSpeed = true,
+    speedChoice = 2,
+    autoVoteMode = true,
+    selectedMode = "Insane",
+    autoSkip = true,
+    noSkipWaves = "",
+    syncSkipMultiAcc = true,
+    autoReplay = true,
+    autoPlay = true,
+    autoSaveRec = true,
+    disableVFX = false,
+    macroName = "Farm",
+    fpsCap = 15,
+    autoExecute = true,
+    startupDelay = bootDelay,
+    autoScaleUI = true,
+    uiScale = 1.0
+}
+
+local S = loadJSON(SETTINGS_FILE) or {}
+for k, v in pairs(DEFAULTS) do
+    if S[k] == nil then S[k] = v end
+end
+
+pcall(function()
+    if S.syncSkipMultiAcc and isfile and readfile and isfile(SHARED_SKIP_FILE) then
+        local sharedFilter = readfile(SHARED_SKIP_FILE)
+        if type(sharedFilter) == "string" then
+            S.noSkipWaves = sharedFilter
+        end
+    end
+end)
+
+S.recording = false
+S.replaying = false
+S.paused = false
+S.skipCurrentStep = false
+S.macro = nil
+S.macroPlayed = false
+S.hasVotedReplay = false
+S.currentStepIndex = 0
+S.totalSteps = 0
+S.currentStepText = "Idle"
+S.teleportQueued = false
+
+local function saveS()
+    local t = {}
+    for k in pairs(DEFAULTS) do
+        t[k] = S[k]
+    end
+    saveJSON(SETTINGS_FILE, t)
+    if writefile then
+        pcall(function()
+            ensureFolders()
+            writefile(DELAY_FILE, tostring(S.startupDelay or 7))
+            if S.syncSkipMultiAcc then
+                writefile(SHARED_SKIP_FILE, tostring(S.noSkipWaves or ""))
+            end
+        end)
+    end
+end
+saveS()
+
+-- ==================== WAVE SKIP FILTER PARSER ====================
+local function isWaveSkipBlocked(wave: number, filterStr: string?): boolean
+    if not wave or wave <= 0 then return false end
+    local raw = tostring(filterStr or "")
+    if raw == "" then return false end
+
+    for token in raw:gmatch("[^,;]+") do
+        local s = token:match("^%s*(.-)%s*$")
+        if s ~= "" then
+            local rStart, rEnd = s:match("^(%d+)%s*%-%s*(%d+)$")
+            if rStart and rEnd then
+                local a = tonumber(rStart)
+                local b = tonumber(rEnd)
+                if a and b then
+                    if a > b then a, b = b, a end
+                    if wave >= a and wave <= b then
+                        return true
+                    end
+                end
+            else
+                local plusWave = s:match("^(%d+)%s*%+$")
+                if plusWave then
+                    local a = tonumber(plusWave)
+                    if a and wave >= a then
+                        return true
+                    end
+                else
+                    local single = tonumber(s)
+                    if single and wave == single then
+                        return true
+                    end
+                end
+            end
+        end
+    end
+    return false
+end
+
+-- ==================== COLOR PALETTE & LOGGING ====================
+local C = {
+    Bg     = Color3.fromRGB(13, 15, 19),
+    Bg2    = Color3.fromRGB(20, 23, 30),
+    Bg3    = Color3.fromRGB(27, 31, 40),
+    Card   = Color3.fromRGB(17, 20, 26),
+    Stroke = Color3.fromRGB(40, 46, 60),
+    Acc    = Color3.fromRGB(0, 205, 255),
+    AccDim = Color3.fromRGB(0, 115, 155),
+    Ok     = Color3.fromRGB(45, 210, 115),
+    Bad    = Color3.fromRGB(245, 75, 85),
+    Gold   = Color3.fromRGB(255, 195, 45),
+    Tx     = Color3.fromRGB(245, 247, 250),
+    Dim    = Color3.fromRGB(150, 158, 175)
+}
+
+local logEntries = {}
+local logDirty = false
+local timelineDirty = true
+local fileListDirty = true
+
+local function addLog(text: string, color: Color3?)
+    local line = os.date("%H:%M:%S") .. " | " .. text
+    table.insert(logEntries, 1, { t = line, c = color or C.Dim })
+    if #logEntries > 60 then
+        logEntries[61] = nil
+    end
+    logDirty = true
+
+    pcall(function()
+        if appendfile and isfile then
+            if isfile(LOG_FILE) then
+                appendfile(LOG_FILE, line .. "\n")
+            elseif writefile then
+                writefile(LOG_FILE, line .. "\n")
+            end
+        end
+    end)
+    print("[CameraTD] " .. text)
+end
+
+-- ==================== AUTO-EXECUTE HANDLER ====================
+local function setupAutoExecute(showLog: boolean?)
+    pcall(function()
+        local getclip = getclipboard or fromclipboard
+        if getclip and writefile then
+            local clip = getclip()
+            if type(clip) == "string" and clip:find("CAMERA TD") then
+                writefile(AUTOEXEC_FILE, clip)
+            end
+        end
+    end)
+
+    local qFunc = queue_on_teleport
+        or queueonteleport
+        or (syn and syn.queue_on_teleport)
+        or (fluxus and fluxus.queue_on_teleport)
+
+    if qFunc and not S.teleportQueued then
+        pcall(function()
+            qFunc(string.format([[
+                if isfile and readfile and isfile(%q) then
+                    local fn = loadstring(readfile(%q))
+                    if fn then task.spawn(fn) end
+                end
+            ]], AUTOEXEC_FILE, AUTOEXEC_FILE))
+            S.teleportQueued = true
+        end)
+    end
+
+    if showLog then
+        addLog(string.format("⚡ Auto-Execute Armed (Delay: %ds)", S.startupDelay or 7), C.Ok)
+    end
+end
+
+trackConn(LP.OnTeleport:Connect(function()
+    if S.autoExecute then
+        setupAutoExecute(false)
+    end
+end))
+
+-- ==================== PERSISTENT FPS LOCK & ANTI-AFK ====================
+local function applyFPSCap(fps: number?)
+    local cap = math.clamp(math.floor(fps or S.fpsCap or 15), 5, 144)
+    pcall(function()
+        local setfps = setfpscap or set_fps_cap
+        if setfps then setfps(cap) end
+    end)
+end
+applyFPSCap(S.fpsCap)
+
+task.spawn(function()
+    while Controller.Running do
+        applyFPSCap(S.fpsCap)
+        task.wait(1.5)
+    end
+end)
+
+trackConn(UserInputService.WindowFocused:Connect(function()
+    if Controller.Running then
+        applyFPSCap(S.fpsCap)
+    end
+end))
+
+trackConn(LP.Idled:Connect(function()
+    pcall(function()
+        if VirtualUser then
+            VirtualUser:CaptureController()
+            VirtualUser:ClickButton2(Vector2.new(100, 100))
+        end
+    end)
+end))
+
+pcall(function()
+    local ps = LP:FindFirstChild("PlayerScripts")
+    local antiMacro = ps and ps:FindFirstChild("AntiMacro")
+    if antiMacro and antiMacro:IsA("LocalScript") then
+        antiMacro.Disabled = true
+    end
+end)
+
+-- ==================== DYNAMIC GAME REFERENCES ====================
+local playerGui = LP:FindFirstChildOfClass("PlayerGui")
+local gameUI = playerGui and playerGui:FindFirstChild("GameUI")
+local gameFolder = workspace:FindFirstChild("Game")
+local towersFolder = gameFolder and gameFolder:FindFirstChild("Towers")
+local ConfigTowers = {}
+local Remotes = {}
+local EngineReady = false
+
+local function applyVFXSetting(disable: boolean)
+    pcall(function()
+        if shared and shared.Modules and shared.Modules.Replication then
+            local rep = shared.Modules.Replication.GetCurrentReplica()
+            if rep and rep.Data and rep.Data.Settings then
+                rep.Data.Settings.VFX = not disable
+            end
+        end
+    end)
+end
+
+-- ==================== ECONOMY & MATCH STATE HELPERS ====================
+local function getCash(): number
+    local leaderstats = LP:FindFirstChild("leaderstats")
+    local moneyObj = leaderstats and leaderstats:FindFirstChild("Money")
+    if moneyObj and moneyObj:IsA("ValueBase") then
+        return tonumber(moneyObj.Value) or 0
+    end
+
+    if not gameUI then
+        playerGui = LP:FindFirstChildOfClass("PlayerGui")
+        gameUI = playerGui and playerGui:FindFirstChild("GameUI")
+    end
+    local title = gameUI and gameUI:FindFirstChild("Stats")
+        and gameUI.Stats:FindFirstChild("OtherUI")
+        and gameUI.Stats.OtherUI:FindFirstChild("Money")
+        and gameUI.Stats.OtherUI.Money:FindFirstChild("Title")
+    if title and title:IsA("TextLabel") and title.Text ~= "" then
+        local clean = title.Text:gsub("[^%d]", "")
+        local val = tonumber(clean)
+        if val then return val end
+    end
+    return 0
+end
+
+local function isGameOver(): boolean
+    local msg = workspace:GetAttribute("Message")
+    if msg == "You Won!" or msg == "You Lost!" then return true end
+    local timer = tonumber(workspace:GetAttribute("PlayAgainTimer"))
+    if timer and timer > 0 then return true end
+    if not gameUI then
+        playerGui = LP:FindFirstChildOfClass("PlayerGui")
+        gameUI = playerGui and playerGui:FindFirstChild("GameUI")
+    end
+    local finalUI = gameUI and gameUI:FindFirstChild("FinalUI")
+    if finalUI and finalUI:IsA("GuiObject") and finalUI.Visible then return true end
+    return false
+end
+
+local function isVotingActive(): boolean
+    if workspace:GetAttribute("IsVoting") == true then return true end
+    if not gameUI then
+        playerGui = LP:FindFirstChildOfClass("PlayerGui")
+        gameUI = playerGui and playerGui:FindFirstChild("GameUI")
+    end
+    local votingUI = gameUI and gameUI:FindFirstChild("GamemodeVoting")
+    if votingUI and votingUI:IsA("GuiObject") and votingUI.Visible then return true end
+    return false
+end
+
+local function isMatchActive(): boolean
+    if isGameOver() or isVotingActive() then return false end
+    if workspace:GetAttribute("GameState") == "Restarting" then return false end
+    local wave = tonumber(workspace:GetAttribute("Wave"))
+    return wave ~= nil and wave >= 1
+end
+
+local function getDistanceXZ(pos1: Vector3, pos2: Vector3): number
+    return math.sqrt((pos1.X - pos2.X)^2 + (pos1.Z - pos2.Z)^2)
+end
+
+local function getTowerPlacementCost(towerName: string, recordedCost: number?): number
+    if recordedCost and tonumber(recordedCost) and tonumber(recordedCost) > 0 then
+        return tonumber(recordedCost)
+    end
+    for slot = 1, 5 do
+        if LP:GetAttribute("Slot" .. slot) == towerName then
+            local slotGui = gameUI and gameUI:FindFirstChild("Slots") and gameUI.Slots:FindFirstChild("Slot" .. slot)
+            local pLbl = slotGui and slotGui:FindFirstChild("TroopFrame") and slotGui.TroopFrame:FindFirstChild("Price")
+            if pLbl and pLbl:IsA("TextLabel") then
+                local clean = pLbl.Text:gsub("[^%d]", "")
+                local num = tonumber(clean)
+                if num and num > 0 then return num end
+            end
+        end
+    end
+    local tData = ConfigTowers[towerName]
+    if tData and tData.Upgrades and tData.Upgrades[1] and tData.Upgrades[1].Price then
+        return tonumber(tData.Upgrades[1].Price) or 100
+    end
+    return 100
+end
+
+local function getTowerUpgradeCost(towerName: string, nextLevel: number, recordedCost: number?): number
+    if recordedCost and tonumber(recordedCost) and tonumber(recordedCost) > 0 then
+        return tonumber(recordedCost)
+    end
+    local tData = ConfigTowers[towerName]
+    if tData and tData.Upgrades and tData.Upgrades[nextLevel] and tData.Upgrades[nextLevel].Price then
+        return tonumber(tData.Upgrades[nextLevel].Price) or 200
+    end
+    return 200
+end
+
+local function resolveUnitIdForTower(towerName: string, fallbackId: string?): string
+    for slot = 1, 5 do
+        local sName = LP:GetAttribute("Slot" .. slot)
+        local sId = LP:GetAttribute("Slot" .. slot .. "Id")
+        if sName == towerName and type(sId) == "string" and sId ~= "" then
+            return sId
+        end
+    end
+
+    local foundId = nil
+    pcall(function()
+        local repMod = RS:FindFirstChild("ModuleLoader")
+            and RS.ModuleLoader:FindFirstChild("Client")
+            and RS.ModuleLoader.Client:FindFirstChild("Replication")
+        if repMod then
+            local rep = require(repMod).GetCurrentReplica()
+            if rep and rep.Data and rep.Data.Towers then
+                for id, data in pairs(rep.Data.Towers) do
+                    if data.Name == towerName and data.Equipped then
+                        foundId = tostring(id)
+                        break
+                    end
+                end
+            end
+        end
+    end)
+    if foundId then return foundId end
+
+    return fallbackId or "1"
+end
+
+-- ==================== RECORDING & REPLAY STATE ====================
+local recData = { version = 4.7, actions = {} }
+local TowerIdToPlacementIndex = {}
+local recordedTowerLevels = {}
+local recordedSoldTowers = {}
+local recordedTowerModes = {}
+local pendingUnitIds = {}
+local lastPlaceTime = 0
+local lastPlacePos = Vector3.zero
+
+local ReplayTowers = {}
+local ActiveTowerLevels = {}
+local ActiveTowerModes = {}
+
+-- ==================== SINGLETON NAMECALL HOOK ====================
+ENV.__CAM_TD_HOOK_CB = function(payload)
+    if not S.recording then return end
+    if type(payload) == "table" and payload.Name then
+        pendingUnitIds[tostring(payload.Name)] = payload.UnitId and tostring(payload.UnitId) or resolveUnitIdForTower(tostring(payload.Name))
+        local now = tick()
+        local pos = payload.Pos or (payload.CFrame and payload.CFrame.Position)
+        if pos then
+            if (now - lastPlaceTime < 0.35) and (getDistanceXZ(lastPlacePos, pos) < 1.0) then
+                return
+            end
+            lastPlaceTime = now
+            lastPlacePos = pos
+        end
+    end
+end
+
+if not ENV.__CAM_TD_NAMECALL_HOOKED and hookmetamethod and getnamecallmethod then
+    ENV.__CAM_TD_NAMECALL_HOOKED = true
+    local oldNamecall
+    oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+        local method = getnamecallmethod()
+        if not checkcaller() and typeof(self) == "Instance" and (method == "FireServer" or method == "fireServer") then
+            if self.Name == "TowerAdd" and ENV.__CAM_TD_HOOK_CB then
+                local args = { ... }
+                task.spawn(function()
+                    pcall(ENV.__CAM_TD_HOOK_CB, args[1])
+                end)
+            end
+        end
+        return oldNamecall(self, ...)
+    end))
+end
+
+-- ==================== REMOTE EVENT BINDINGS ====================
+local function bindRemoteListeners()
+    if Remotes.TowerAdd then
+        trackConn(Remotes.TowerAdd.OnClientEvent:Connect(function(data)
+            if not data or not data.Id then return end
+            local isMine = (data.OwnerUserId == LP.UserId) or (data.OwnerName == LP.Name)
+            if not isMine or not data.Pos then return end
+
+            local tId = tostring(data.Id)
+            local tName = tostring(data.Name or "Tower")
+            local pos = data.Pos
+            local rawCf = data.CFrame or (pos and CFrame.new(pos)) or CFrame.identity
+            local _, yawRad, _ = rawCf:ToOrientation()
+            local cf = CFrame.new(pos) * CFrame.Angles(0, yawRad, 0)
+
+            if S.recording and not TowerIdToPlacementIndex[tId] then
+                local newIdx = #recData.actions + 1
+                local savedUnitId = pendingUnitIds[tName] or resolveUnitIdForTower(tName, "1")
+                local liveCost = (data.Stats and tonumber(data.Stats.Price)) or getTowerPlacementCost(tName)
+                TowerIdToPlacementIndex[tId] = newIdx
+                recordedTowerLevels[tId] = 1
+
+                table.insert(recData.actions, {
+                    type = "place",
+                    placementIndex = newIdx,
+                    towerName = tName,
+                    unitId = savedUnitId,
+                    cost = liveCost,
+                    pos = { pos.X, pos.Y, pos.Z },
+                    cframe = { cf:GetComponents() }
+                })
+                timelineDirty = true
+                addLog(string.format("📍 [REC #%d] Place %s ($%d)", newIdx, tName, liveCost), C.Ok)
+            end
+
+            if S.replaying then
+                ActiveTowerLevels[tId] = 1
+                if S.macro and S.macro.actions then
+                    for _, act in ipairs(S.macro.actions) do
+                        if act.type == "place" and act.pos then
+                            local actPos = Vector3.new(act.pos[1], act.pos[2], act.pos[3])
+                            if getDistanceXZ(actPos, pos) < 2.8 then
+                                ReplayTowers[act.placementIndex] = tId
+                                break
+                            end
+                        end
+                    end
+                end
+            end
+        end))
+    end
+
+    if Remotes.TowerUpgrade then
+        trackConn(Remotes.TowerUpgrade.OnClientEvent:Connect(function(data)
+            if not data or not data.Id then return end
+            local tId = tostring(data.Id)
+            local lvl = tonumber(data.Level)
+
+            if S.replaying and lvl then
+                ActiveTowerLevels[tId] = lvl
+            end
+
+            if S.recording then
+                local pIdx = TowerIdToPlacementIndex[tId]
+                if not pIdx then return end
+
+                local newLvl = lvl or ((recordedTowerLevels[tId] or 1) + 1)
+                local lastLvl = recordedTowerLevels[tId] or 1
+
+                if newLvl > lastLvl then
+                    recordedTowerLevels[tId] = newLvl
+                    local towerName = "Unknown"
+                    for _, act in ipairs(recData.actions) do
+                        if act.type == "place" and act.placementIndex == pIdx then
+                            towerName = act.towerName
+                            break
+                        end
+                    end
+
+                    local upgCost = getTowerUpgradeCost(towerName, newLvl)
+                    table.insert(recData.actions, {
+                        type = "upgrade",
+                        placementIndex = pIdx,
+                        towerName = towerName,
+                        targetLevel = newLvl,
+                        cost = upgCost,
+                        towerId = tId
+                    })
+                    timelineDirty = true
+                    addLog(string.format("⬆ [REC] Upgraded #%d (%s) -> Lvl %d", pIdx, towerName, newLvl), C.Acc)
+                end
+            end
+        end))
+    end
+
+    local removeEvent = Remotes.TowerRemove or Remotes.TowerSell
+    if removeEvent then
+        trackConn(removeEvent.OnClientEvent:Connect(function(data)
+            if not S.recording then return end
+            local tId = data and (data.Id and tostring(data.Id) or (data.Index and tostring(data.Index)))
+            if not tId then return end
+
+            local pIdx = TowerIdToPlacementIndex[tId]
+            if pIdx and not recordedSoldTowers[tId] then
+                recordedSoldTowers[tId] = true
+                table.insert(recData.actions, {
+                    type = "sell",
+                    placementIndex = pIdx,
+                    towerId = tId
+                })
+                timelineDirty = true
+                addLog(string.format("🗑 [REC] Sold Unit #%d", pIdx), C.Bad)
+            end
+        end))
+    end
+
+    if Remotes.TowerTarget then
+        trackConn(Remotes.TowerTarget.OnClientEvent:Connect(function(data)
+            if not data or not data.Id or not data.TargetMode then return end
+            local tId = tostring(data.Id)
+            local newMode = tostring(data.TargetMode)
+            ActiveTowerModes[tId] = newMode
+
+            if S.recording then
+                local pIdx = TowerIdToPlacementIndex[tId]
+                if pIdx and (recordedTowerModes[tId] ~= newMode) then
+                    recordedTowerModes[tId] = newMode
+                    table.insert(recData.actions, {
+                        type = "target",
+                        placementIndex = pIdx,
+                        targetMode = newMode,
+                        towerId = tId
+                    })
+                    timelineDirty = true
+                    addLog(string.format("🎯 [REC] Target Mode #%d -> %s", pIdx, newMode), C.Gold)
+                end
+            end
+        end))
+    end
+end
+
+-- ==================== REPLAY ENGINE ====================
+local function findPlacedTowerModelByPos(targetPos: Vector3, maxDist: number?): Instance?
+    if not towersFolder then
+        gameFolder = workspace:FindFirstChild("Game")
+        towersFolder = gameFolder and gameFolder:FindFirstChild("Towers")
+    end
+    if not towersFolder then return nil end
+
+    local threshold = maxDist or 2.8
+    local closestModel, closestDist = nil, 999999
+
+    for _, child in ipairs(towersFolder:GetChildren()) do
+        if child:IsA("Model") then
+            local pivot = child:GetPivot().Position
+            local dist = getDistanceXZ(pivot, targetPos)
+            if dist < closestDist then
+                closestDist = dist
+                closestModel = child
+            end
+        end
+    end
+    if closestDist <= threshold then
+        return closestModel
+    end
+    return nil
+end
+
+local function awaitCashAndPause(cost: number, sL: any, actionDesc: string): string
+    while Controller.Running and S.replaying and isMatchActive() do
+        if S.skipCurrentStep then
+            S.skipCurrentStep = false
+            return "SKIP"
+        end
+        if S.paused then
+            if sL then
+                sL.Text = "⏸ Replay Paused (" .. actionDesc .. ")"
+                sL.TextColor3 = C.Gold
+            end
+            task.wait(0.15)
+            continue
+        end
+        if cost <= 0 or getCash() >= cost then
+            if sL then sL.TextColor3 = C.Ok end
+            return "OK"
+        end
+        if sL then
+            sL.Text = string.format("⏳ Need $%d/$%d (%s)", getCash(), cost, actionDesc)
+            sL.TextColor3 = C.Gold
+        end
+        task.wait(0.15)
+    end
+    return "ABORT"
+end
+
+local function executeReplay(macroData: table, sL: any)
+    if S.replaying then return end
+    if not macroData or not macroData.actions or #macroData.actions == 0 then
+        addLog("❌ Replay aborted: Macro has 0 actions.", C.Bad)
+        return
+    end
+
+    if not isMatchActive() then
+        addLog("⏳ Replay queued: Waiting for Wave 1...", C.Gold)
+        if sL then sL.Text = "⏳ Awaiting Wave 1..." end
+        while not isMatchActive() and Controller.Running do
+            task.wait(0.35)
+        end
+    end
+    if not Controller.Running then return end
+
+    table.clear(ReplayTowers)
+    table.clear(ActiveTowerLevels)
+    table.clear(ActiveTowerModes)
+    S.replaying = true
+    S.paused = false
+    S.skipCurrentStep = false
+    S.macro = macroData
+    S.totalSteps = #macroData.actions
+    S.currentStepIndex = 0
+
+    addLog(string.format("▶ REPLAY STARTED: %s (%d Steps)", macroData.name or S.macroName, #macroData.actions), C.Acc)
+
+    for i, a in ipairs(macroData.actions) do
+        if not S.replaying or not Controller.Running or not isMatchActive() then
+            addLog("⏹ Replay Interrupted (Match Ended / Reset).", C.Gold)
+            break
+        end
+
+        S.currentStepIndex = i
+        local stepSummary = string.format("#%d %s", i, tostring(a.type):upper())
+        if a.type == "place" then
+            stepSummary = string.format("Place %s (#%d)", tostring(a.towerName), a.placementIndex or i)
+        elseif a.type == "upgrade" then
+            stepSummary = string.format("Upg #%d -> Lvl %d", a.placementIndex or 0, a.targetLevel or 2)
+        elseif a.type == "sell" then
+            stepSummary = string.format("Sell Unit #%d", a.placementIndex or 0)
+        elseif a.type == "target" then
+            stepSummary = string.format("Target #%d -> %s", a.placementIndex or 0, tostring(a.targetMode))
+        end
+        S.currentStepText = stepSummary
+        timelineDirty = true
+
+        if sL then
+            sL.Text = string.format("▶ [%d/%d] %s", i, #macroData.actions, stepSummary)
+            sL.TextColor3 = C.Acc
+        end
+
+        -- 1. PLACE
+        if a.type == "place" then
+            local targetPos = Vector3.new(a.pos[1], a.pos[2], a.pos[3])
+            local yawRad = 0
+            if a.cframe and #a.cframe == 12 then
+                local okCf, parsedCf = pcall(function()
+                    return CFrame.new(unpack(a.cframe))
+                end)
+                if okCf and parsedCf then
+                    local _, y, _ = parsedCf:ToOrientation()
+                    yawRad = y
+                end
+            end
+            local cf = CFrame.new(targetPos) * CFrame.Angles(0, yawRad, 0)
+
+            local existing = findPlacedTowerModelByPos(targetPos, 2.2)
+            if existing then
+                ReplayTowers[a.placementIndex] = existing.Name
+                ActiveTowerLevels[existing.Name] = ActiveTowerLevels[existing.Name] or 1
+                addLog(string.format("⏭ Unit #%d (%s) already on field", a.placementIndex, a.towerName), C.Dim)
+                continue
+            end
+
+            local cost = getTowerPlacementCost(a.towerName, a.cost)
+            local status = awaitCashAndPause(cost, sL, "Place " .. a.towerName)
+            if status == "ABORT" then break end
+            if status == "SKIP" then
+                addLog(string.format("⏭ Skipped Step #%d (%s)", i, stepSummary), C.Gold)
+                continue
+            end
+
+            local unitId = resolveUnitIdForTower(a.towerName, a.unitId)
+            local placed = false
+            local attempts = 0
+
+            while not placed and attempts < 10 and S.replaying and isMatchActive() and Controller.Running do
+                if S.skipCurrentStep then
+                    S.skipCurrentStep = false
+                    break
+                end
+                if Remotes.TowerAdd then
+                    pcall(function()
+                        Remotes.TowerAdd:FireServer({
+                            Name = a.towerName,
+                            UnitId = unitId,
+                            Pos = targetPos,
+                            CFrame = cf
+                        })
+                    end)
+                end
+
+                local startWait = tick()
+                while tick() - startWait < 1.4 and S.replaying and isMatchActive() do
+                    if ReplayTowers[a.placementIndex] then
+                        placed = true
+                        break
+                    end
+                    local found = findPlacedTowerModelByPos(targetPos, 2.8)
+                    if found then
+                        ReplayTowers[a.placementIndex] = found.Name
+                        ActiveTowerLevels[found.Name] = ActiveTowerLevels[found.Name] or 1
+                        placed = true
+                        break
+                    end
+                    task.wait(0.05)
+                end
+                attempts += 1
+            end
+
+            if placed then
+                addLog(string.format("📍 Placed: %s (#%d)", a.towerName, a.placementIndex), C.Ok)
+            else
+                addLog(string.format("❌ Place Failed/Skipped: %s (#%d)", a.towerName, a.placementIndex), C.Bad)
+            end
+            task.wait(0.1)
+
+        -- 2. UPGRADE
+        elseif a.type == "upgrade" then
+            local tId = ReplayTowers[a.placementIndex]
+            local model = tId and towersFolder and towersFolder:FindFirstChild(tId)
+
+            if not model then
+                for _, prevAct in ipairs(macroData.actions) do
+                    if prevAct.type == "place" and prevAct.placementIndex == a.placementIndex and prevAct.pos then
+                        local pPos = Vector3.new(prevAct.pos[1], prevAct.pos[2], prevAct.pos[3])
+                        model = findPlacedTowerModelByPos(pPos, 2.8)
+                        if model then
+                            tId = model.Name
+                            ReplayTowers[a.placementIndex] = tId
+                            break
+                        end
+                    end
+                end
+            end
+
+            if model and tId and Remotes.TowerUpgrade then
+                local towerName = a.towerName
+                if not towerName or towerName == "" or towerName == "Unknown" then
+                    for _, prevAct in ipairs(macroData.actions) do
+                        if prevAct.type == "place" and prevAct.placementIndex == a.placementIndex then
+                            towerName = prevAct.towerName
+                            break
+                        end
+                    end
+                end
+                towerName = towerName or "Scientist Cameraman"
+
+                local currentLvl = ActiveTowerLevels[tId] or 1
+                local targetLvl = a.targetLevel or (currentLvl + 1)
+
+                if currentLvl >= targetLvl then
+                    addLog(string.format("⏭ Unit #%d already Lvl %d", a.placementIndex, currentLvl), C.Dim)
+                    continue
+                end
+
+                local cost = getTowerUpgradeCost(towerName, targetLvl, a.cost)
+                local status = awaitCashAndPause(cost, sL, string.format("Upg #%d -> Lvl %d", a.placementIndex, targetLvl))
+                if status == "ABORT" then break end
+                if status == "SKIP" then
+                    addLog(string.format("⏭ Skipped Step #%d (%s)", i, stepSummary), C.Gold)
+                    continue
+                end
+
+                local upgraded = false
+                local attempts = 0
+
+                while not upgraded and attempts < 6 and S.replaying and isMatchActive() and Controller.Running do
+                    if S.skipCurrentStep then
+                        S.skipCurrentStep = false
+                        break
+                    end
+                    pcall(function()
+                        Remotes.TowerUpgrade:FireServer({ Id = tId })
+                    end)
+
+                    local waitStart = tick()
+                    while tick() - waitStart < 1.8 and S.replaying and isMatchActive() do
+                        if (ActiveTowerLevels[tId] or 1) >= targetLvl then
+                            upgraded = true
+                            break
+                        end
+                        task.wait(0.05)
+                    end
+
+                    if not upgraded and getCash() < (cost - 10) then
+                        local graceStart = tick()
+                        while tick() - graceStart < 2.5 and S.replaying do
+                            if (ActiveTowerLevels[tId] or 1) >= targetLvl then
+                                upgraded = true
+                                break
+                            end
+                            task.wait(0.1)
+                        end
+                    end
+                    attempts += 1
+                end
+
+                if upgraded then
+                    ActiveTowerLevels[tId] = targetLvl
+                    addLog(string.format("⬆ Upgraded: #%d (%s) -> Lvl %d", a.placementIndex, towerName, targetLvl), C.Acc)
+                else
+                    addLog(string.format("❌ Upgrade Failed: #%d -> Lvl %d", a.placementIndex, targetLvl), C.Bad)
+                end
+            else
+                addLog(string.format("⚠️ Unit #%d not found for upgrade", a.placementIndex), C.Gold)
+            end
+            task.wait(0.1)
+
+        -- 3. SELL
+        elseif a.type == "sell" then
+            local status = awaitCashAndPause(0, sL, "Sell #" .. tostring(a.placementIndex))
+            if status == "ABORT" then break end
+            if status ~= "SKIP" then
+                local tId = ReplayTowers[a.placementIndex]
+                if tId and Remotes.TowerSell then
+                    pcall(function()
+                        Remotes.TowerSell:FireServer({ Id = tId })
+                    end)
+                    ReplayTowers[a.placementIndex] = nil
+                    ActiveTowerLevels[tId] = nil
+                    addLog(string.format("🗑 Sold Unit #%d", a.placementIndex), C.Bad)
+                end
+            end
+            task.wait(0.1)
+
+        -- 4. TARGET
+        elseif a.type == "target" then
+            local status = awaitCashAndPause(0, sL, "Target #" .. tostring(a.placementIndex))
+            if status == "ABORT" then break end
+            if status ~= "SKIP" then
+                local tId = ReplayTowers[a.placementIndex]
+                if tId and Remotes.TowerTarget then
+                    pcall(function()
+                        Remotes.TowerTarget:FireServer({ Id = tId })
+                    end)
+                    addLog(string.format("🎯 Target Mode #%d -> %s", a.placementIndex, tostring(a.targetMode)), C.Gold)
+                end
+            end
+            task.wait(0.1)
+        end
+    end
+
+    S.replaying = false
+    S.paused = false
+    S.currentStepIndex = 0
+    S.currentStepText = "Completed"
+    timelineDirty = true
+    addLog("🏁 Replay sequence finished.", C.Ok)
+    if sL then
+        sL.Text = not isMatchActive() and "🏁 Match Ended" or "✅ Replay Complete"
+        sL.TextColor3 = C.Ok
+    end
+end
+
+-- ==================== TABBED UI ARCHITECTURE ====================
+local gui = Instance.new("ScreenGui")
+gui.Name = "CameraTD_PrecisionV47"
+gui.ResetOnSpawn = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+local parentGui = nil
+if gethui then
+    pcall(function() parentGui = gethui() end)
+end
+if not parentGui then
+    local ok, core = pcall(game.GetService, game, "CoreGui")
+    parentGui = (ok and core) or LP:WaitForChild("PlayerGui")
+end
+gui.Parent = parentGui
+
+local WIN_W, WIN_H = 350, 445
+local main = Instance.new("Frame", gui)
+main.Size = UDim2.fromOffset(WIN_W, WIN_H)
+main.Position = UDim2.new(0, 24, 0.5, -WIN_H / 2)
+main.BackgroundColor3 = C.Bg
+main.BorderSizePixel = 0
+main.Active = true
+Instance.new("UICorner", main).CornerRadius = UDim.new(0, 10)
+local mainStroke = Instance.new("UIStroke", main)
+mainStroke.Color = C.Stroke
+mainStroke.Thickness = 1.5
+
+local uiScaleObj = Instance.new("UIScale", main)
+
+local function updateAdaptiveScale()
+    local cam = workspace.CurrentCamera
+    if not cam then return end
+    local vp = cam.ViewportSize
+    if S.autoScaleUI then
+        local fitH = (vp.Y - 24) / WIN_H
+        local fitW = (vp.X - 24) / WIN_W
+        uiScaleObj.Scale = math.clamp(math.min(fitH, fitW, 1.0), 0.60, 1.0)
+    else
+        uiScaleObj.Scale = math.clamp(tonumber(S.uiScale) or 1.0, 0.60, 1.2)
+    end
+end
+updateAdaptiveScale()
+if workspace.CurrentCamera then
+    trackConn(workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(updateAdaptiveScale))
+end
+
+local hdr = Instance.new("Frame", main)
+hdr.Size = UDim2.new(1, 0, 0, 36)
+hdr.BackgroundColor3 = C.Bg2
+hdr.BorderSizePixel = 0
+Instance.new("UICorner", hdr).CornerRadius = UDim.new(0, 10)
+
+local titleLbl = Instance.new("TextLabel", hdr)
+titleLbl.Size = UDim2.new(1, -110, 0, 18)
+titleLbl.Position = UDim2.fromOffset(12, 4)
+titleLbl.BackgroundTransparency = 1
+titleLbl.Text = "⚡ CAMERA TD // MACRO STUDIO v4.7"
+titleLbl.TextColor3 = C.Tx
+titleLbl.TextSize = 11
+titleLbl.Font = Enum.Font.GothamBlack
+titleLbl.TextXAlignment = Enum.TextXAlignment.Left
+
+local subTitleLbl = Instance.new("TextLabel", hdr)
+subTitleLbl.Size = UDim2.new(1, -110, 0, 12)
+subTitleLbl.Position = UDim2.fromOffset(12, 20)
+subTitleLbl.BackgroundTransparency = 1
+subTitleLbl.Text = "⏳ Linking Game Engine..."
+subTitleLbl.TextColor3 = C.Gold
+subTitleLbl.TextSize = 8
+subTitleLbl.Font = Enum.Font.GothamMedium
+subTitleLbl.TextXAlignment = Enum.TextXAlignment.Left
+
+local function makeHeaderBtn(txt: string, xOff: number, col: Color3)
+    local b = Instance.new("TextButton", hdr)
+    b.Size = UDim2.fromOffset(24, 22)
+    b.Position = UDim2.new(1, xOff, 0.5, -11)
+    b.BackgroundColor3 = col
+    b.Text = txt
+    b.TextColor3 = C.Tx
+    b.TextSize = 10
+    b.Font = Enum.Font.GothamBold
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 5)
+    return b
+end
+
+local minB = makeHeaderBtn("—", -56, C.Bg3)
+local clsB = makeHeaderBtn("✕", -28, C.Bad)
+
+local banner = Instance.new("Frame", main)
+banner.Size = UDim2.new(1, -16, 0, 42)
+banner.Position = UDim2.fromOffset(8, 42)
+banner.BackgroundColor3 = C.Card
+banner.BorderSizePixel = 0
+Instance.new("UICorner", banner).CornerRadius = UDim.new(0, 7)
+local banStroke = Instance.new("UIStroke", banner)
+banStroke.Color = C.Stroke
+
+local statusLabel = Instance.new("TextLabel", banner)
+statusLabel.Size = UDim2.new(1, -16, 0, 16)
+statusLabel.Position = UDim2.fromOffset(8, 4)
+statusLabel.BackgroundTransparency = 1
+statusLabel.Text = "🎮 Ready | Waiting for Match..."
+statusLabel.TextColor3 = C.Ok
+statusLabel.TextSize = 10
+statusLabel.Font = Enum.Font.GothamBold
+statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+local telemetryLabel = Instance.new("TextLabel", banner)
+telemetryLabel.Size = UDim2.new(1, -16, 0, 14)
+telemetryLabel.Position = UDim2.fromOffset(8, 22)
+telemetryLabel.BackgroundTransparency = 1
+telemetryLabel.Text = "Wave: 0 | Cash: $0 | Units: 0/15 | Base HP: 1000"
+telemetryLabel.TextColor3 = C.Dim
+telemetryLabel.TextSize = 8
+telemetryLabel.Font = Enum.Font.Code
+telemetryLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+local tabBar = Instance.new("Frame", main)
+tabBar.Size = UDim2.new(1, -16, 0, 26)
+tabBar.Position = UDim2.fromOffset(8, 90)
+tabBar.BackgroundColor3 = C.Bg2
+tabBar.BorderSizePixel = 0
+Instance.new("UICorner", tabBar).CornerRadius = UDim.new(0, 6)
+local tabLayout = Instance.new("UIListLayout", tabBar)
+tabLayout.FillDirection = Enum.FillDirection.Horizontal
+tabLayout.SortOrder = Enum.SortOrder.LayoutOrder
+tabLayout.Padding = UDim.new(0, 3)
+local tabPad = Instance.new("UIPadding", tabBar)
+tabPad.PaddingLeft = UDim.new(0, 3)
+tabPad.PaddingRight = UDim.new(0, 3)
+tabPad.PaddingTop = UDim.new(0, 3)
+tabPad.PaddingBottom = UDim.new(0, 3)
+
+local pagesFolder = Instance.new("Frame", main)
+pagesFolder.Size = UDim2.new(1, -16, 1, -124)
+pagesFolder.Position = UDim2.fromOffset(8, 120)
+pagesFolder.BackgroundTransparency = 1
+
+local tabButtons = {}
+local tabPages = {}
+
+local function createTab(name: string, order: number)
+    local btn = Instance.new("TextButton", tabBar)
+    btn.Size = UDim2.new(0.2, -3, 1, 0)
+    btn.LayoutOrder = order
+    btn.BackgroundColor3 = order == 1 and C.AccDim or C.Bg3
+    btn.Text = name
+    btn.TextColor3 = order == 1 and C.Tx or C.Dim
+    btn.TextSize = 8
+    btn.Font = Enum.Font.GothamBold
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 4)
+
+    local page = Instance.new("ScrollingFrame", pagesFolder)
+    page.Size = UDim2.fromScale(1, 1)
+    page.BackgroundTransparency = 1
+    page.ScrollBarThickness = 2
+    page.ScrollBarImageColor3 = C.Acc
+    page.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    page.CanvasSize = UDim2.new(0, 0, 0, 0)
+    page.Visible = (order == 1)
+
+    local layout = Instance.new("UIListLayout", page)
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Padding = UDim.new(0, 6)
+
+    local pad = Instance.new("UIPadding", page)
+    pad.PaddingBottom = UDim.new(0, 8)
+    pad.PaddingRight = UDim.new(0, 4)
+
+    tabButtons[name] = btn
+    tabPages[name] = page
+
+    btn.Activated:Connect(function()
+        for tName, tBtn in pairs(tabButtons) do
+            local active = (tName == name)
+            tBtn.BackgroundColor3 = active and C.AccDim or C.Bg3
+            tBtn.TextColor3 = active and C.Tx or C.Dim
+            tabPages[tName].Visible = active
+        end
+    end)
+
+    return page
+end
+
+local pageMacro = createTab("MACRO", 1)
+local pageAuto  = createTab("AUTO", 2)
+local pageExec  = createTab("EXEC", 3)
+local pagePerf  = createTab("PERF", 4)
+local pageLogs  = createTab("LOGS", 5)
+
+local orderCounter = 0
+local function nextOrder()
+    orderCounter += 1
+    return orderCounter
+end
+
+local function mkSection(parent: Instance, title: string, height: number)
+    local card = Instance.new("Frame", parent)
+    card.Size = UDim2.new(1, 0, 0, height)
+    card.BackgroundColor3 = C.Bg2
+    card.LayoutOrder = nextOrder()
+    Instance.new("UICorner", card).CornerRadius = UDim.new(0, 7)
+    local st = Instance.new("UIStroke", card)
+    st.Color = C.Stroke
+
+    local hdrText = Instance.new("TextLabel", card)
+    hdrText.Size = UDim2.new(1, -12, 0, 14)
+    hdrText.Position = UDim2.fromOffset(8, 4)
+    hdrText.BackgroundTransparency = 1
+    hdrText.Text = title:upper()
+    hdrText.TextColor3 = C.Acc
+    hdrText.TextSize = 8
+    hdrText.Font = Enum.Font.GothamBlack
+    hdrText.TextXAlignment = Enum.TextXAlignment.Left
+    return card
+end
+
+local function mkButton(parent: Instance, text: string, xScale: number, yPos: number, wScale: number, h: number, col: Color3, cb: any?)
+    local b = Instance.new("TextButton", parent)
+    b.Size = UDim2.new(wScale, -6, 0, h)
+    b.Position = UDim2.new(xScale, 4, 0, yPos)
+    b.BackgroundColor3 = col
+    b.Text = text
+    b.TextColor3 = C.Tx
+    b.TextSize = 9
+    b.Font = Enum.Font.GothamBold
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 5)
+    if cb then
+        b.Activated:Connect(cb)
+    end
+    return b
+end
+
+local function mkToggle(parent: Instance, label: string, yPos: number, key: string, cb: any?)
+    local on = S[key] or false
+    local row = Instance.new("TextButton", parent)
+    row.Size = UDim2.new(1, -12, 0, 24)
+    row.Position = UDim2.fromOffset(6, yPos)
+    row.BackgroundColor3 = C.Card
+    row.Text = ""
+    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 5)
+
+    local checkBox = Instance.new("TextLabel", row)
+    checkBox.Size = UDim2.fromOffset(16, 16)
+    checkBox.Position = UDim2.fromOffset(6, 4)
+    checkBox.BackgroundColor3 = on and C.Ok or C.Bg3
+    checkBox.Text = on and "✓" or ""
+    checkBox.TextColor3 = C.Bg
+    checkBox.TextSize = 11
+    checkBox.Font = Enum.Font.GothamBlack
+    Instance.new("UICorner", checkBox).CornerRadius = UDim.new(0, 4)
+
+    local lbl = Instance.new("TextLabel", row)
+    lbl.Size = UDim2.new(1, -68, 1, 0)
+    lbl.Position = UDim2.fromOffset(28, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = label
+    lbl.TextColor3 = C.Tx
+    lbl.TextSize = 9
+    lbl.Font = Enum.Font.GothamMedium
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+
+    local pill = Instance.new("Frame", row)
+    pill.Size = UDim2.fromOffset(30, 14)
+    pill.Position = UDim2.new(1, -36, 0.5, -7)
+    pill.BackgroundColor3 = on and C.Ok or C.Bg3
+    Instance.new("UICorner", pill).CornerRadius = UDim.new(1, 0)
+
+    local knob = Instance.new("Frame", pill)
+    knob.Size = UDim2.fromOffset(10, 10)
+    knob.Position = on and UDim2.new(1, -12, 0.5, -5) or UDim2.fromOffset(2, 2)
+    knob.BackgroundColor3 = C.Tx
+    Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
+
+    row.Activated:Connect(function()
+        on = not on
+        S[key] = on
+        saveS()
+        checkBox.BackgroundColor3 = on and C.Ok or C.Bg3
+        checkBox.Text = on and "✓" or ""
+        pill.BackgroundColor3 = on and C.Ok or C.Bg3
+        knob.Position = on and UDim2.new(1, -12, 0.5, -5) or UDim2.fromOffset(2, 2)
+        if cb then cb(on) end
+    end)
+end
+
+local function mkCycler(parent: Instance, values: {any}, startIdx: number, yPos: number, onChange: any)
+    local idx = math.clamp(startIdx or 1, 1, #values)
+    local f = Instance.new("Frame", parent)
+    f.Size = UDim2.new(1, -12, 0, 22)
+    f.Position = UDim2.fromOffset(6, yPos)
+    f.BackgroundColor3 = C.Card
+    Instance.new("UICorner", f).CornerRadius = UDim.new(0, 5)
+
+    local lB = Instance.new("TextButton", f)
+    lB.Size = UDim2.new(0, 24, 1, 0)
+    lB.BackgroundColor3 = C.Bg3
+    lB.Text = "◀"
+    lB.TextColor3 = C.Tx
+    lB.TextSize = 9
+    lB.Font = Enum.Font.GothamBold
+    Instance.new("UICorner", lB).CornerRadius = UDim.new(0, 5)
+
+    local rB = Instance.new("TextButton", f)
+    rB.Size = UDim2.new(0, 24, 1, 0)
+    rB.Position = UDim2.new(1, -24, 0, 0)
+    rB.BackgroundColor3 = C.Bg3
+    rB.Text = "▶"
+    rB.TextColor3 = C.Tx
+    rB.TextSize = 9
+    rB.Font = Enum.Font.GothamBold
+    Instance.new("UICorner", rB).CornerRadius = UDim.new(0, 5)
+
+    local label = Instance.new("TextLabel", f)
+    label.Size = UDim2.new(1, -52, 1, 0)
+    label.Position = UDim2.fromOffset(26, 0)
+    label.BackgroundTransparency = 1
+    label.TextColor3 = C.Acc
+    label.TextSize = 9
+    label.Font = Enum.Font.GothamBold
+    label.Text = tostring(values[idx])
+
+    lB.Activated:Connect(function()
+        idx -= 1
+        if idx < 1 then idx = #values end
+        label.Text = tostring(values[idx])
+        onChange(values[idx], idx)
+    end)
+    rB.Activated:Connect(function()
+        idx += 1
+        if idx > #values then idx = 1 end
+        label.Text = tostring(values[idx])
+        onChange(values[idx], idx)
+    end)
+end
+
+-- ==================== TAB 1: MACRO STUDIO ====================
+local ctrlCard = mkSection(pageMacro, "Macro Controls & Profile", 142)
+
+local nb = Instance.new("TextBox", ctrlCard)
+nb.Size = UDim2.new(1, -12, 0, 22)
+nb.Position = UDim2.fromOffset(6, 20)
+nb.BackgroundColor3 = C.Card
+nb.Text = S.macroName or "Farm"
+nb.PlaceholderText = "Enter macro profile name..."
+nb.TextColor3 = C.Acc
+nb.PlaceholderColor3 = C.Dim
+nb.TextSize = 9
+nb.Font = Enum.Font.GothamBold
+nb.ClearTextOnFocus = false
+Instance.new("UICorner", nb).CornerRadius = UDim.new(0, 5)
+nb.FocusLost:Connect(function()
+    if nb.Text ~= "" then
+        S.macroName = nb.Text
+        saveS()
+    end
+end)
+
+local function syncMacroFromRec(name: string)
+    local cloned = table.clone(recData.actions)
+    S.macro = {
+        name = name,
+        date = os.date(),
+        actions = cloned
+    }
+    timelineDirty = true
+end
+
+local function saveCurrentMacro(name: string): boolean
+    if name == "" then
+        addLog("⚠️ Enter a macro name first!", C.Gold)
+        return false
+    end
+    local actionsToSave = (#recData.actions > 0 and recData.actions) or (S.macro and S.macro.actions) or {}
+    if #actionsToSave == 0 then
+        addLog("⚠️ Cannot save an empty macro (0 actions).", C.Gold)
+        return false
+    end
+    S.macroName = name
+    nb.Text = name
+    saveS()
+    local payload = {
+        name = name,
+        date = os.date(),
+        actions = actionsToSave
+    }
+    S.macro = payload
+    recData.actions = table.clone(actionsToSave)
+    local ok = saveJSON(MACRO_FOLDER .. "/" .. name .. ".json", payload)
+    fileListDirty = true
+    timelineDirty = true
+    if ok then
+        addLog(string.format("💾 Saved '%s' (%d actions)", name, #actionsToSave), C.Ok)
+    else
+        addLog("❌ Failed to write file", C.Bad)
+    end
+    return ok
+end
+
+local function loadMacroByName(name: string): boolean
+    if name == "" then return false end
+    local d = loadJSON(MACRO_FOLDER .. "/" .. name .. ".json")
+    if d and type(d.actions) == "table" then
+        S.macro = d
+        recData.actions = table.clone(d.actions)
+        S.macroName = name
+        nb.Text = name
+        saveS()
+        timelineDirty = true
+        fileListDirty = true
+        addLog(string.format("📂 Loaded '%s' (%d actions)", name, #d.actions), C.Ok)
+        return true
+    else
+        addLog("❌ Macro file not found: " .. name, C.Bad)
+        return false
+    end
+end
+
+local g_recB = mkButton(ctrlCard, "⏺ RECORD", 0, 46, 0.5, 22, C.Bad)
+local g_stpB = mkButton(ctrlCard, "⏹ STOP REC", 0, 46, 0.5, 22, C.Gold)
+g_stpB.Visible = false
+
+g_recB.Activated:Connect(function()
+    if S.recording then return end
+    if S.replaying then
+        S.replaying = false
+        task.wait(0.1)
+    end
+    table.clear(TowerIdToPlacementIndex)
+    table.clear(recordedTowerLevels)
+    table.clear(recordedSoldTowers)
+    table.clear(recordedTowerModes)
+    recData.actions = {}
+    S.recording = true
+    g_recB.Visible = false
+    g_stpB.Visible = true
+    timelineDirty = true
+    statusLabel.Text = "⏺ RECORDING ACTIONS..."
+    statusLabel.TextColor3 = C.Bad
+    addLog("⏺ RECORDING STARTED", C.Bad)
+end)
+
+g_stpB.Activated:Connect(function()
+    if not S.recording then return end
+    S.recording = false
+    g_recB.Visible = true
+    g_stpB.Visible = false
+    syncMacroFromRec(nb.Text ~= "" and nb.Text or S.macroName)
+    statusLabel.Text = string.format("⏹ Recorded %d Actions", #recData.actions)
+    statusLabel.TextColor3 = C.Gold
+    addLog(string.format("⏹ RECORDING STOPPED (%d Actions)", #recData.actions), C.Ok)
+    if S.autoSaveRec and #recData.actions > 0 then
+        saveCurrentMacro(nb.Text ~= "" and nb.Text or S.macroName)
+    end
+end)
+
+local g_repB = mkButton(ctrlCard, "▶ REPLAY", 0.5, 46, 0.5, 22, C.Acc, function()
+    if S.replaying then
+        S.replaying = false
+        S.paused = false
+        addLog("⏹ Replay stopped by user.", C.Gold)
+        return
+    end
+    local d = S.macro
+    if not d or not d.actions or #d.actions == 0 then
+        if #recData.actions > 0 then
+            syncMacroFromRec(nb.Text)
+            d = S.macro
+        else
+            loadMacroByName(nb.Text)
+            d = S.macro
+        end
+    end
+    if not d or not d.actions or #d.actions == 0 then
+        addLog("❌ No macro actions loaded to replay!", C.Bad)
+        return
+    end
+    task.spawn(function()
+        executeReplay(d, statusLabel)
+    end)
+end)
+
+mkButton(ctrlCard, "💾 SAVE", 0, 72, 0.333, 20, C.Ok, function()
+    saveCurrentMacro(nb.Text)
+end)
+
+mkButton(ctrlCard, "📂 LOAD", 0.333, 72, 0.333, 20, C.AccDim, function()
+    loadMacroByName(nb.Text)
+end)
+
+mkButton(ctrlCard, "🗑 DELETE", 0.666, 72, 0.334, 20, C.Bad, function()
+    local n = nb.Text
+    if n == "" then return end
+    pcall(function()
+        if delfile and isfile and isfile(MACRO_FOLDER .. "/" .. n .. ".json") then
+            delfile(MACRO_FOLDER .. "/" .. n .. ".json")
+        end
+    end)
+    fileListDirty = true
+    addLog("🗑 Deleted macro file: " .. n, C.Gold)
+end)
+
+local g_pauseB = mkButton(ctrlCard, "⏸ PAUSE", 0, 96, 0.333, 20, C.Bg3, function()
+    if not S.replaying then return end
+    S.paused = not S.paused
+    addLog(S.paused and "⏸ Replay Paused" or "▶ Replay Resumed", C.Gold)
+end)
+
+mkButton(ctrlCard, "⏭ SKIP STEP", 0.333, 96, 0.333, 20, C.Bg3, function()
+    if S.replaying then
+        S.skipCurrentStep = true
+    end
+end)
+
+mkButton(ctrlCard, "↩ UNDO ACT", 0.666, 96, 0.334, 20, C.Bg3, function()
+    local targetList = (#recData.actions > 0 and recData.actions) or (S.macro and S.macro.actions)
+    if targetList and #targetList > 0 then
+        local removed = table.remove(targetList)
+        syncMacroFromRec(nb.Text)
+        timelineDirty = true
+        addLog("↩ Removed last action: " .. tostring(removed and removed.type or "?"), C.Gold)
+    end
+end)
+
+local actCountLbl = Instance.new("TextLabel", ctrlCard)
+actCountLbl.Size = UDim2.new(1, -12, 0, 16)
+actCountLbl.Position = UDim2.fromOffset(6, 120)
+actCountLbl.BackgroundTransparency = 1
+actCountLbl.TextColor3 = C.Dim
+actCountLbl.TextSize = 8
+actCountLbl.Font = Enum.Font.Code
+actCountLbl.TextXAlignment = Enum.TextXAlignment.Left
+actCountLbl.Text = "Loaded: None (0 Actions) | Step: 0/0"
+
+local filesCard = mkSection(pageMacro, "Saved Macro Profiles (Click to Load)", 92)
+local refreshFilesBtn = mkButton(filesCard, "↻ Refresh", 0.76, 2, 0.24, 15, C.Bg3, function()
+    fileListDirty = true
+end)
+refreshFilesBtn.TextSize = 7
+
+local filesScroll = Instance.new("ScrollingFrame", filesCard)
+filesScroll.Size = UDim2.new(1, -12, 1, -24)
+filesScroll.Position = UDim2.fromOffset(6, 20)
+filesScroll.BackgroundColor3 = C.Card
+filesScroll.BorderSizePixel = 0
+filesScroll.ScrollBarThickness = 2
+filesScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+filesScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+Instance.new("UICorner", filesScroll).CornerRadius = UDim.new(0, 5)
+
+local timelineCard = mkSection(pageMacro, "Macro Action Timeline", 130)
+local clearActsBtn = mkButton(timelineCard, "Clear All", 0.76, 2, 0.24, 15, C.Bad, function()
+    recData.actions = {}
+    if S.macro then S.macro.actions = {} end
+    timelineDirty = true
+    addLog("🧹 Cleared current macro actions in memory.", C.Gold)
+end)
+clearActsBtn.TextSize = 7
+
+local timelineScroll = Instance.new("ScrollingFrame", timelineCard)
+timelineScroll.Size = UDim2.new(1, -12, 1, -24)
+timelineScroll.Position = UDim2.fromOffset(6, 20)
+timelineScroll.BackgroundColor3 = C.Card
+timelineScroll.BorderSizePixel = 0
+timelineScroll.ScrollBarThickness = 2
+timelineScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+timelineScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+Instance.new("UICorner", timelineScroll).CornerRadius = UDim.new(0, 5)
+
+-- ==================== TAB 2: MATCH AUTOMATION & STOP-SKIP ====================
+local skipCard = mkSection(pageAuto, "Smart Wave-Skip Filter (Multi-Account)", 128)
+mkToggle(skipCard, "Auto Skip Wave (Instant)", 20, "autoSkip")
+
+local skipHint = Instance.new("TextLabel", skipCard)
+skipHint.Size = UDim2.new(1, -12, 0, 14)
+skipHint.Position = UDim2.fromOffset(8, 46)
+skipHint.BackgroundTransparency = 1
+skipHint.Text = "Stop Skip Waves (e.g. 5-15, 16, 17 or 5, 15):"
+skipHint.TextColor3 = C.Dim
+skipHint.TextSize = 8
+skipHint.Font = Enum.Font.GothamBold
+skipHint.TextXAlignment = Enum.TextXAlignment.Left
+
+local skipBox = Instance.new("TextBox", skipCard)
+skipBox.Size = UDim2.new(1, -12, 0, 22)
+skipBox.Position = UDim2.fromOffset(6, 62)
+skipBox.BackgroundColor3 = C.Card
+skipBox.Text = tostring(S.noSkipWaves or "")
+skipBox.PlaceholderText = "Example: 5-15, 16, 17 (leave empty to skip all)"
+skipBox.TextColor3 = C.Gold
+skipBox.PlaceholderColor3 = C.Dim
+skipBox.TextSize = 9
+skipBox.Font = Enum.Font.Code
+skipBox.ClearTextOnFocus = false
+Instance.new("UICorner", skipBox).CornerRadius = UDim.new(0, 5)
+
+skipBox.FocusLost:Connect(function()
+    S.noSkipWaves = skipBox.Text:match("^%s*(.-)%s*$") or ""
+    saveS()
+    addLog("🛑 No-Skip Waves set to: " .. (S.noSkipWaves ~= "" and S.noSkipWaves or "None (Skip All)"), C.Gold)
+end)
+
+mkToggle(skipCard, "Sync No-Skip Waves Across All Accounts", 90, "syncSkipMultiAcc", function(on)
+    if on then saveS() end
+end)
+
+local autoCard = mkSection(pageAuto, "Match & Wave Automation", 204)
+mkToggle(autoCard, "Auto Game Speed Lock", 20, "autoSpeed")
+
+local speeds = { "1x Speed", "1.5x Speed", "2x Speed" }
+local speedVals = { 1, 1.5, 2 }
+local spIdx = table.find(speedVals, S.speedChoice) or 3
+mkCycler(autoCard, speeds, spIdx, 48, function(_, idx)
+    S.speedChoice = speedVals[idx]
+    saveS()
+    addLog("⚡ Speed Lock: " .. S.speedChoice .. "x", C.Acc)
+end)
+
+mkToggle(autoCard, "Auto Vote Gamemode", 76, "autoVoteMode")
+local modes = { "Easy", "Normal", "Hard", "Insane", "Nightmare" }
+local mIdx = table.find(modes, S.selectedMode) or 4
+mkCycler(autoCard, modes, mIdx, 104, function(val)
+    S.selectedMode = val
+    saveS()
+    addLog("🗳️ Target Mode: " .. val, C.Acc)
+end)
+
+mkToggle(autoCard, "Auto Replay (Play Again)", 132, "autoReplay")
+mkToggle(autoCard, "Auto Play Macro On Wave 1", 160, "autoPlay")
+
+-- ==================== TAB 3: AUTO-EXECUTE & 7s DELAY ====================
+local execCard = mkSection(pageExec, "Auto-Execute & Startup Delay", 124)
+
+mkToggle(execCard, "Auto Execute Script", 20, "autoExecute", function(on)
+    if on then
+        setupAutoExecute(true)
+    end
+end)
+
+local delayHint = Instance.new("TextLabel", execCard)
+delayHint.Size = UDim2.new(1, -12, 0, 14)
+delayHint.Position = UDim2.fromOffset(8, 48)
+delayHint.BackgroundTransparency = 1
+delayHint.Text = "Startup Load Delay (Seconds):"
+delayHint.TextColor3 = C.Dim
+delayHint.TextSize = 8
+delayHint.Font = Enum.Font.GothamBold
+delayHint.TextXAlignment = Enum.TextXAlignment.Left
+
+local delayBox = Instance.new("TextBox", execCard)
+delayBox.Size = UDim2.new(1, -12, 0, 22)
+delayBox.Position = UDim2.fromOffset(6, 64)
+delayBox.BackgroundColor3 = C.Card
+delayBox.Text = tostring(S.startupDelay or 7)
+delayBox.PlaceholderText = "7"
+delayBox.TextColor3 = C.Ok
+delayBox.PlaceholderColor3 = C.Dim
+delayBox.TextSize = 9
+delayBox.Font = Enum.Font.Code
+delayBox.ClearTextOnFocus = false
+Instance.new("UICorner", delayBox).CornerRadius = UDim.new(0, 5)
+
+delayBox.FocusLost:Connect(function()
+    local num = tonumber(delayBox.Text:match("([%d%.]+)"))
+    local clamped = math.clamp(num or 7, 1, 60)
+    S.startupDelay = clamped
+    delayBox.Text = tostring(clamped)
+    saveS()
+    addLog(string.format("⏱️ Startup Delay saved: %ds", clamped), C.Ok)
+end)
+
+mkButton(execCard, "⚡ Auto Execute Script", 0, 92, 1, 24, C.AccDim, function()
+    S.autoExecute = true
+    S.teleportQueued = false
+    saveS()
+    setupAutoExecute(true)
+end)
+
+local scaleCard = mkSection(pageExec, "Phone UI Size", 78)
+mkToggle(scaleCard, "Auto-Fit UI Scale To Phone Screen", 20, "autoScaleUI", function()
+    updateAdaptiveScale()
+end)
+
+local function setManualScale(sc: number)
+    S.autoScaleUI = false
+    S.uiScale = sc
+    saveS()
+    updateAdaptiveScale()
+    addLog(string.format("📱 UI Size: %d%%", math.round(sc * 100)), C.Acc)
+end
+
+mkButton(scaleCard, "70%", 0, 48, 0.25, 20, C.Bg3, function() setManualScale(0.70) end)
+mkButton(scaleCard, "80%", 0.25, 48, 0.25, 20, C.Bg3, function() setManualScale(0.80) end)
+mkButton(scaleCard, "90%", 0.50, 48, 0.25, 20, C.Bg3, function() setManualScale(0.90) end)
+mkButton(scaleCard, "100%", 0.75, 48, 0.25, 20, C.Bg3, function() setManualScale(1.00) end)
+
+-- ==================== TAB 4: PERFORMANCE & FPS SLIDER ====================
+local perfCard = mkSection(pagePerf, "Hardware FPS Cap & Anti-Lag", 120)
+
+local fpsTitle = Instance.new("TextLabel", perfCard)
+fpsTitle.Size = UDim2.new(1, -12, 0, 16)
+fpsTitle.Position = UDim2.fromOffset(6, 20)
+fpsTitle.BackgroundTransparency = 1
+fpsTitle.Text = string.format("FPS Limit: %d FPS (Hardware Locked)", S.fpsCap)
+fpsTitle.TextColor3 = C.Acc
+fpsTitle.TextSize = 9
+fpsTitle.Font = Enum.Font.GothamBold
+fpsTitle.TextXAlignment = Enum.TextXAlignment.Left
+
+local sliderBar = Instance.new("Frame", perfCard)
+sliderBar.Size = UDim2.new(1, -16, 0, 10)
+sliderBar.Position = UDim2.fromOffset(8, 40)
+sliderBar.BackgroundColor3 = C.Card
+Instance.new("UICorner", sliderBar).CornerRadius = UDim.new(1, 0)
+local slStroke = Instance.new("UIStroke", sliderBar)
+slStroke.Color = C.Stroke
+
+local sliderFill = Instance.new("Frame", sliderBar)
+local curRel = math.clamp((S.fpsCap - 5) / 139, 0, 1)
+sliderFill.Size = UDim2.new(curRel, 0, 1, 0)
+sliderFill.BackgroundColor3 = C.Acc
+Instance.new("UICorner", sliderFill).CornerRadius = UDim.new(1, 0)
+
+local draggingSlider = false
+local function updateSlider(xPos: number)
+    local barX = sliderBar.AbsolutePosition.X
+    local barW = math.max(sliderBar.AbsoluteSize.X, 1)
+    local rel = math.clamp((xPos - barX) / barW, 0, 1)
+    local targetFps = math.round(5 + rel * 139)
+    sliderFill.Size = UDim2.new(rel, 0, 1, 0)
+    fpsTitle.Text = string.format("FPS Limit: %d FPS (Hardware Locked)", targetFps)
+    S.fpsCap = targetFps
+    saveS()
+    applyFPSCap(targetFps)
+end
+
+trackConn(sliderBar.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        draggingSlider = true
+        updateSlider(input.Position.X)
+    end
+end))
+trackConn(UserInputService.InputChanged:Connect(function(input)
+    if draggingSlider and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+        updateSlider(input.Position.X)
+    end
+end))
+trackConn(UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        draggingSlider = false
+    end
+end))
+
+local function setPresetFPS(fps: number)
+    S.fpsCap = fps
+    saveS()
+    applyFPSCap(fps)
+    sliderFill.Size = UDim2.new(math.clamp((fps - 5) / 139, 0, 1), 0, 1, 0)
+    fpsTitle.Text = string.format("FPS Limit: %d FPS (Hardware Locked)", fps)
+end
+
+mkButton(perfCard, "10 FPS", 0, 58, 0.25, 20, C.Bg3, function() setPresetFPS(10) end)
+mkButton(perfCard, "15 FPS", 0.25, 58, 0.25, 20, C.Bg3, function() setPresetFPS(15) end)
+mkButton(perfCard, "30 FPS", 0.50, 58, 0.25, 20, C.Bg3, function() setPresetFPS(30) end)
+mkButton(perfCard, "60 FPS", 0.75, 58, 0.25, 20, C.Bg3, function() setPresetFPS(60) end)
+
+mkToggle(perfCard, "Disable Game Attack VFX & Shake", 86, "disableVFX", function(on)
+    applyVFXSetting(on)
+end)
+
+-- ==================== TAB 5: LIVE CONSOLE ====================
+local logCard = mkSection(pageLogs, "Execution Console Log", 295)
+local logBox = Instance.new("ScrollingFrame", logCard)
+logBox.Size = UDim2.new(1, -12, 1, -24)
+logBox.Position = UDim2.fromOffset(6, 20)
+logBox.BackgroundColor3 = C.Card
+logBox.BorderSizePixel = 0
+logBox.ScrollBarThickness = 2
+logBox.AutomaticCanvasSize = Enum.AutomaticSize.Y
+logBox.CanvasSize = UDim2.new(0, 0, 0, 0)
+Instance.new("UICorner", logBox).CornerRadius = UDim.new(0, 5)
+
+-- ==================== DRAGGING & WINDOW CONTROLS ====================
+local draggingWin, dragStart, startPos = false, nil, nil
+trackConn(hdr.InputBegan:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+        draggingWin = true
+        dragStart = i.Position
+        startPos = main.Position
+    end
+end))
+trackConn(hdr.InputEnded:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+        draggingWin = false
+    end
+end))
+trackConn(UserInputService.InputChanged:Connect(function(i)
+    if draggingWin and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+        local delta = i.Position - dragStart
+        main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+    end
+end))
+
+local minimized = false
+minB.Activated:Connect(function()
+    minimized = not minimized
+    banner.Visible = not minimized
+    tabBar.Visible = not minimized
+    pagesFolder.Visible = not minimized
+    TweenService:Create(main, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+        Size = minimized and UDim2.fromOffset(WIN_W, 36) or UDim2.fromOffset(WIN_W, WIN_H)
+    }):Play()
+    minB.Text = minimized and "+" or "—"
+end)
+
+trackConn(UserInputService.InputBegan:Connect(function(input, gp)
+    if not gp and input.KeyCode == Enum.KeyCode.RightControl then
+        main.Visible = not main.Visible
+    end
+end))
+
+function Controller.Unload()
+    Controller.Running = false
+    _G.__CAM_TD_MACRO = false
+    S.recording = false
+    S.replaying = false
+    ENV.__CAM_TD_HOOK_CB = nil
+    saveS()
+    for _, c in ipairs(Controller.Connections) do
+        pcall(function() c:Disconnect() end)
+    end
+    table.clear(Controller.Connections)
+    if gui and gui.Parent then
+        gui:Destroy()
+    end
+end
+
+clsB.Activated:Connect(Controller.Unload)
+
+-- ==================== UI LIST RENDERERS ====================
+local function renderMacroFileList()
+    filesScroll:ClearAllChildren()
+    local l = Instance.new("UIListLayout", filesScroll)
+    l.SortOrder = Enum.SortOrder.LayoutOrder
+    l.Padding = UDim.new(0, 2)
+    local p = Instance.new("UIPadding", filesScroll)
+    p.PaddingTop = UDim.new(0, 3)
+    p.PaddingBottom = UDim.new(0, 3)
+    p.PaddingLeft = UDim.new(0, 4)
+    p.PaddingRight = UDim.new(0, 4)
+
+    local files = listMacroFiles()
+    if #files == 0 then
+        local empty = Instance.new("TextLabel", filesScroll)
+        empty.Size = UDim2.new(1, 0, 0, 18)
+        empty.BackgroundTransparency = 1
+        empty.Text = "No saved .json macros found in folder"
+        empty.TextColor3 = C.Dim
+        empty.TextSize = 8
+        empty.Font = Enum.Font.Code
+        return
+    end
+
+    for idx, fName in ipairs(files) do
+        local isCurrent = (fName == S.macroName)
+        local row = Instance.new("TextButton", filesScroll)
+        row.Size = UDim2.new(1, 0, 0, 18)
+        row.LayoutOrder = idx
+        row.BackgroundColor3 = isCurrent and C.AccDim or C.Bg2
+        row.Text = string.format("  %s %s.json", isCurrent and "★" or "📄", fName)
+        row.TextColor3 = isCurrent and C.Tx or C.Dim
+        row.TextSize = 8
+        row.Font = Enum.Font.GothamBold
+        row.TextXAlignment = Enum.TextXAlignment.Left
+        Instance.new("UICorner", row).CornerRadius = UDim.new(0, 4)
+
+        row.Activated:Connect(function()
+            loadMacroByName(fName)
+        end)
+    end
+end
+
+local function renderActionTimeline()
+    timelineScroll:ClearAllChildren()
+    local l = Instance.new("UIListLayout", timelineScroll)
+    l.SortOrder = Enum.SortOrder.LayoutOrder
+    l.Padding = UDim.new(0, 2)
+    local p = Instance.new("UIPadding", timelineScroll)
+    p.PaddingTop = UDim.new(0, 3)
+    p.PaddingBottom = UDim.new(0, 3)
+    p.PaddingLeft = UDim.new(0, 4)
+    p.PaddingRight = UDim.new(0, 4)
+
+    local actions = (#recData.actions > 0 and recData.actions) or (S.macro and S.macro.actions) or {}
+    if #actions == 0 then
+        local empty = Instance.new("TextLabel", timelineScroll)
+        empty.Size = UDim2.new(1, 0, 0, 18)
+        empty.BackgroundTransparency = 1
+        empty.Text = "No actions recorded or loaded."
+        empty.TextColor3 = C.Dim
+        empty.TextSize = 8
+        empty.Font = Enum.Font.Code
+        return
+    end
+
+    local maxShow = math.min(#actions, 60)
+    for i = 1, maxShow do
+        local a = actions[i]
+        local isCurrent = (S.replaying and S.currentStepIndex == i)
+        local desc = ""
+        local col = C.Dim
+
+        if a.type == "place" then
+            local c = getTowerPlacementCost(a.towerName, a.cost)
+            desc = string.format("[%d] PLACE #%d: %s ($%d)", i, a.placementIndex or i, tostring(a.towerName), c)
+            col = C.Ok
+        elseif a.type == "upgrade" then
+            local c = getTowerUpgradeCost(a.towerName or "", a.targetLevel or 2, a.cost)
+            desc = string.format("[%d] UPGRADE #%d -> Lvl %d ($%d)", i, a.placementIndex or 0, a.targetLevel or 2, c)
+            col = C.Acc
+        elseif a.type == "sell" then
+            desc = string.format("[%d] SELL Unit #%d", i, a.placementIndex or 0)
+            col = C.Bad
+        elseif a.type == "target" then
+            desc = string.format("[%d] TARGET #%d -> %s", i, a.placementIndex or 0, tostring(a.targetMode))
+            col = C.Gold
+        end
+
+        local item = Instance.new("TextLabel", timelineScroll)
+        item.Size = UDim2.new(1, 0, 0, 14)
+        item.LayoutOrder = i
+        item.BackgroundTransparency = isCurrent and 0.2 or 1
+        item.BackgroundColor3 = C.AccDim
+        item.Text = (isCurrent and "▶ " or "  ") .. desc
+        item.TextColor3 = isCurrent and C.Tx or col
+        item.TextSize = 8
+        item.Font = Enum.Font.Code
+        item.TextXAlignment = Enum.TextXAlignment.Left
+        Instance.new("UICorner", item).CornerRadius = UDim.new(0, 3)
+    end
+end
+
+-- ==================== ASYNC ENGINE LINKER (ORIGINAL v4.7) ====================
+task.spawn(function()
+    addLog("⏳ Initializing Camera TD Precision Engine...", C.Acc)
+
+    pcall(function() loadMacroByName(S.macroName) end)
+    pcall(renderMacroFileList)
+    pcall(renderActionTimeline)
+
+    if S.autoExecute then
+        setupAutoExecute(false)
+    end
+
+    while Controller.Running and not EngineReady do
+        playerGui = LP:FindFirstChildOfClass("PlayerGui")
+        gameUI = playerGui and playerGui:FindFirstChild("GameUI")
+        gameFolder = workspace:FindFirstChild("Game")
+        towersFolder = gameFolder and gameFolder:FindFirstChild("Towers")
+
+        local ml = RS:FindFirstChild("ModuleLoader")
+        local sh = ml and ml:FindFirstChild("Shared")
+        local net = sh and sh:FindFirstChild("Network")
+        local re = net and net:FindFirstChild("RemoteEvent")
+        local rf = net and net:FindFirstChild("RemoteFunction")
+
+        if re and rf then
+            Remotes.TowerAdd     = re:FindFirstChild("TowerAdd")
+            Remotes.TowerUpgrade = re:FindFirstChild("TowerUpgrade")
+            Remotes.TowerSell    = re:FindFirstChild("TowerSell")
+            Remotes.TowerTarget  = re:FindFirstChild("TowerTarget")
+            Remotes.TowerRemove  = re:FindFirstChild("TowerRemove")
+            Remotes.ModeVote     = re:FindFirstChild("ModeVote")
+            Remotes.WaveSkip     = re:FindFirstChild("WaveSkip")
+            Remotes.PlayAgain    = re:FindFirstChild("PlayAgain")
+            Remotes.ChangeSpeed  = rf:FindFirstChild("ChangeSpeed")
+
+            if Remotes.TowerAdd and Remotes.TowerUpgrade then
+                pcall(function()
+                    local cfgMod = ml:FindFirstChild("Configs") and ml.Configs:FindFirstChild("Config")
+                    if cfgMod then
+                        local loadedCfg = require(cfgMod)
+                        if loadedCfg and loadedCfg.Towers then
+                            ConfigTowers = loadedCfg.Towers
+                            timelineDirty = true
+                        end
+                    end
+                end)
+
+                bindRemoteListeners()
+                if S.disableVFX then
+                    applyVFXSetting(true)
+                end
+                EngineReady = true
+                subTitleLbl.Text = "✅ Engine Linked | R-Ctrl or — to Minimize"
+                subTitleLbl.TextColor3 = C.Ok
+                addLog("✅ Game Remotes & Live Configs Linked!", C.Ok)
+                break
+            end
+        end
+        task.wait(0.5)
+    end
+end)
+
+-- ==================== CENTRAL SUPERVISOR LOOP ====================
+task.spawn(function()
+    local lastBlockedWaveLog = 0
+    while Controller.Running and gui.Parent do
+        local isOver = isGameOver()
+        local isVoting = isVotingActive()
+        local isPlaying = isMatchActive()
+        local curWave = tonumber(workspace:GetAttribute("Wave")) or 0
+
+        if S.syncSkipMultiAcc and isfile and readfile then
+            pcall(function()
+                if isfile(SHARED_SKIP_FILE) and not skipBox:IsFocused() then
+                    local diskVal = readfile(SHARED_SKIP_FILE)
+                    if type(diskVal) == "string" and diskVal ~= S.noSkipWaves then
+                        S.noSkipWaves = diskVal
+                        skipBox.Text = diskVal
+                    end
+                end
+            end)
+        end
+
+        if EngineReady then
+            -- 1. Game Speed Enforcer
+            if S.autoSpeed and isPlaying and Remotes.ChangeSpeed then
+                local curSpeed = workspace:GetAttribute("GameSpeed")
+                if curSpeed ~= S.speedChoice then
+                    pcall(function()
+                        Remotes.ChangeSpeed:InvokeServer(S.speedChoice)
+                    end)
+                end
+            end
+
+            -- 2. Gamemode Auto-Vote
+            if S.autoVoteMode and isVoting and Remotes.ModeVote then
+                local votersRaw = workspace:GetAttribute(S.selectedMode .. "Voters")
+                local alreadyVoted = false
+                if votersRaw and votersRaw ~= "" then
+                    local ok, voters = pcall(function()
+                        return HttpService:JSONDecode(votersRaw)
+                    end)
+                    if ok and type(voters) == "table" and table.find(voters, LP.UserId) then
+                        alreadyVoted = true
+                    end
+                end
+                if not alreadyVoted then
+                    pcall(function()
+                        Remotes.ModeVote:FireServer(S.selectedMode)
+                    end)
+                    addLog("🗳️ Voted Mode: " .. S.selectedMode, C.Ok)
+                end
+            end
+
+            -- 3. Wave Skip Enforcer (with Stop-Skip Wave Filter)
+            if S.autoSkip and isPlaying and Remotes.WaveSkip then
+                if workspace:GetAttribute("CanSkip") == true then
+                    if isWaveSkipBlocked(curWave, S.noSkipWaves) then
+                        if lastBlockedWaveLog ~= curWave then
+                            lastBlockedWaveLog = curWave
+                            addLog(string.format("🛑 Auto-Skip paused on Wave %d (Filter: %s)", curWave, S.noSkipWaves), C.Gold)
+                        end
+                    else
+                        pcall(function()
+                            Remotes.WaveSkip:FireServer()
+                        end)
+                    end
+                end
+            end
+
+            -- 4. Auto Play Again
+            if isOver then
+                if not S.hasVotedReplay and S.autoReplay and Remotes.PlayAgain then
+                    S.hasVotedReplay = true
+                    pcall(function()
+                        Remotes.PlayAgain:FireServer()
+                    end)
+                    addLog("⚡ [AutoReplay] Fired PlayAgain Vote!", C.Ok)
+                end
+            else
+                S.hasVotedReplay = false
+            end
+
+            -- 5. Interruption Watchdog
+            if not isPlaying and S.replaying then
+                S.replaying = false
+                S.paused = false
+                table.clear(ReplayTowers)
+                table.clear(ActiveTowerLevels)
+                timelineDirty = true
+                addLog("⏹ Replay Reset: Match transitioned to Voting/Lobby.", C.Gold)
+            end
+
+            -- 6. AutoPlay Trigger (Strictly gated to Wave >= 1)
+            if S.autoPlay and isPlaying and curWave >= 1 and not S.replaying and not S.recording and not S.macroPlayed then
+                S.macroPlayed = true
+                task.spawn(function()
+                    task.wait(1.2)
+                    if S.autoPlay and isMatchActive() and not S.replaying and Controller.Running then
+                        local d = S.macro
+                        if not d or not d.actions or #d.actions == 0 then
+                            loadMacroByName(S.macroName)
+                            d = S.macro
+                        end
+                        if d and d.actions and #d.actions > 0 then
+                            addLog("🤖 [AutoPlay] Starting Macro: " .. (d.name or S.macroName), C.Acc)
+                            executeReplay(d, statusLabel)
+                        end
+                    end
+                end)
+            end
+
+            if not isPlaying or curWave == 0 then
+                S.macroPlayed = false
+            end
+        end
+
+        local curCash = getCash()
+        local curPlaced = LP:FindFirstChild("PlacedTowers") and LP.PlacedTowers.Value or 0
+        local basePart = gameFolder and gameFolder:FindFirstChild("Base")
+        local baseHp = basePart and basePart:GetAttribute("Health") or 1000
+        local baseMax = basePart and basePart:GetAttribute("MaxHealth") or 1000
+        local skipBlocked = isWaveSkipBlocked(curWave, S.noSkipWaves)
+        telemetryLabel.Text = string.format("Wave: %d%s | Cash: $%d | Units: %d/15 | Base: %d/%d", curWave, skipBlocked and " [NO-SKIP]" or "", curCash, curPlaced, baseHp, baseMax)
+
+        if not S.replaying and not S.recording then
+            if isOver then
+                statusLabel.Text = "🏁 Match Concluded (Waiting for Replay...)"
+                statusLabel.TextColor3 = C.Gold
+            elseif isVoting then
+                statusLabel.Text = "🗳️ Voting Gamemode (" .. S.selectedMode .. ")"
+                statusLabel.TextColor3 = C.Acc
+            elseif curWave == 0 then
+                statusLabel.Text = "⏳ Intermission (Wave 0 Gate Active)"
+                statusLabel.TextColor3 = C.Gold
+            elseif isPlaying then
+                statusLabel.Text = "🎮 Match Active | Cash: $" .. curCash
+                statusLabel.TextColor3 = C.Ok
+            end
+        end
+
+        local ac = (#recData.actions > 0 and #recData.actions) or (S.macro and S.macro.actions and #S.macro.actions) or 0
+        actCountLbl.Text = string.format("Profile: %s (%d Acts) | Step: %d/%d", S.macroName, ac, S.currentStepIndex, S.totalSteps)
+
+        g_repB.Text = S.replaying and "⏹ STOP REPLAY" or "▶ REPLAY"
+        g_repB.BackgroundColor3 = S.replaying and C.Bad or C.Acc
+        g_pauseB.Text = S.paused and "▶ RESUME" or "⏸ PAUSE"
+        g_pauseB.BackgroundColor3 = S.paused and C.Gold or C.Bg3
+
+        if fileListDirty then
+            fileListDirty = false
+            pcall(renderMacroFileList)
+        end
+
+        if timelineDirty then
+            timelineDirty = false
+            pcall(renderActionTimeline)
+        end
+
+        if logDirty then
+            logDirty = false
+            logBox:ClearAllChildren()
+            local lLayout = Instance.new("UIListLayout", logBox)
+            lLayout.SortOrder = Enum.SortOrder.LayoutOrder
+            lLayout.Padding = UDim.new(0, 2)
+            local lPad = Instance.new("UIPadding", logBox)
+            lPad.PaddingTop = UDim.new(0, 4)
+            lPad.PaddingLeft = UDim.new(0, 4)
+
+            for idx, entry in ipairs(logEntries) do
+                local line = Instance.new("TextLabel", logBox)
+                line.Size = UDim2.new(1, -6, 0, 12)
+                line.BackgroundTransparency = 1
+                line.Text = entry.t
+                line.TextColor3 = entry.c
+                line.TextSize = 8
+                line.Font = Enum.Font.Code
+                line.TextXAlignment = Enum.TextXAlignment.Left
+                line.LayoutOrder = idx
+            end
+        end
+
+        task.wait(0.2)
+    end
+end)
