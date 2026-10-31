@@ -1,4 +1,3 @@
--- __CAM_TD_OBSIDIAN_V5
 if not game:IsLoaded() then
     game.Loaded:Wait()
 end
@@ -7,39 +6,10 @@ local GITHUB_URL = "https://raw.githubusercontent.com/sergohappwils/CameraTD/ref
 local OBSIDIAN_REPO = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main/"
 local FOLDER = "CameraTD_Macro"
 local DELAY_FILE = FOLDER .. "/startup_delay.txt"
-local AUTOEXEC_FILE = FOLDER .. "/obsidian_v5_cache.luau"
-local LEGACY_CACHE_FILE = FOLDER .. "/autoexec_cache.luau"
+local AUTOEXEC_FILE = FOLDER .. "/autoexec_cache.luau"
 
--- ==================== 1. SELF-CACHE CAPTURE & STARTUP DELAY ====================
-local function ensureFolders()
-    pcall(function()
-        if makefolder and isfolder then
-            if not isfolder(FOLDER) then makefolder(FOLDER) end
-            if not isfolder(FOLDER .. "/macros") then makefolder(FOLDER .. "/macros") end
-        end
-    end)
-end
-ensureFolders()
-
--- If the user just copied this v5 script to clipboard to execute in Potassium, cache it immediately for server hops
-pcall(function()
-    local getclip = getclipboard or fromclipboard
-    if getclip and writefile then
-        local clip = getclip()
-        if type(clip) == "string" and clip:find("__CAM_TD_OBSIDIAN_V5", 1, true) and #clip > 1000 then
-            writefile(AUTOEXEC_FILE, clip)
-        end
-    end
-    -- Remove legacy v4.7 cache file if it contains the old UI
-    if isfile and readfile and delfile and isfile(LEGACY_CACHE_FILE) then
-        local oldSrc = readfile(LEGACY_CACHE_FILE)
-        if type(oldSrc) == "string" and oldSrc:find("CameraTD_PrecisionV47", 1, true) then
-            delfile(LEGACY_CACHE_FILE)
-        end
-    end
-end)
-
-local bootDelay = 3
+-- ==================== 1. STARTUP DELAY (DEFAULT 7s) ====================
+local bootDelay = 7
 pcall(function()
     if isfile and readfile and isfile(DELAY_FILE) then
         local num = tonumber(readfile(DELAY_FILE):match("([%d%.]+)"))
@@ -51,7 +21,7 @@ end)
 
 task.wait(bootDelay)
 
--- ==================== 2. SINGLETON & LEGACY v4.7 UI CLEANUP ====================
+-- ==================== 2. SINGLETON & LEGACY UI CLEANUP GUARD ====================
 local ENV = (getgenv and getgenv()) or _G
 if ENV.__CAM_TD_CONTROLLER then
     pcall(function()
@@ -60,7 +30,6 @@ if ENV.__CAM_TD_CONTROLLER then
     task.wait(0.2)
 end
 
--- Destroy any leftover v4.7 UI (CameraTD_PrecisionV47)
 local function destroyLegacyUI()
     pcall(function()
         if gethui then
@@ -106,6 +75,16 @@ local SETTINGS_FILE = FOLDER .. "/" .. LP.Name .. "_settings.json"
 local SHARED_SKIP_FILE = FOLDER .. "/shared_skip_waves.txt"
 local LOG_FILE = FOLDER .. "/" .. LP.Name .. "_log.txt"
 
+local function ensureFolders()
+    pcall(function()
+        if makefolder and isfolder then
+            if not isfolder(FOLDER) then makefolder(FOLDER) end
+            if not isfolder(MACRO_FOLDER) then makefolder(MACRO_FOLDER) end
+        end
+    end)
+end
+ensureFolders()
+
 local logEntries = {}
 local StatusLabels = {}
 local lastLabelTexts = {}
@@ -132,6 +111,13 @@ local function addLog(text, isError)
     if #logEntries > 30 then
         logEntries[31] = nil
     end
+    pcall(function()
+        if appendfile and isfile and isfile(LOG_FILE) then
+            appendfile(LOG_FILE, line .. "\n")
+        elseif writefile then
+            writefile(LOG_FILE, line .. "\n")
+        end
+    end)
     if isError then
         warn("[CameraTD] " .. tostring(text))
     else
@@ -233,7 +219,6 @@ for k, v in pairs(DEFAULTS) do
     if S[k] == nil then S[k] = v end
 end
 
--- Sanitize any old "< ... >" strings saved from earlier versions
 S.selectedMap = cleanStr(S.selectedMap)
 S.joinMethod = cleanStr(S.joinMethod)
 S.summonCrate = cleanStr(S.summonCrate)
@@ -269,7 +254,7 @@ local function saveS()
         saveJSON(SETTINGS_FILE, t)
         if writefile then
             ensureFolders()
-            writefile(DELAY_FILE, tostring(S.startupDelay or 3))
+            writefile(DELAY_FILE, tostring(S.startupDelay or 7))
             if S.syncSkipMultiAcc then
                 writefile(SHARED_SKIP_FILE, tostring(S.noSkipWaves or ""))
             end
@@ -306,91 +291,65 @@ local function notify(title, desc, duration)
     end)
 end
 
--- ==================== 6. POTASSIUM TELEPORT QUEUE & AUTO-EXECUTE ====================
-local function clearOldTeleportQueue()
-    pcall(function()
-        local clearFn = clearteleportqueue
-            or clear_teleport_queue
-            or (syn and syn.clear_teleport_queue)
-            or (ENV and (ENV.clearteleportqueue or ENV.clear_teleport_queue))
-        if clearFn then
-            clearFn()
-        end
-    end)
-end
-
+-- ==================== 6. GITHUB + TELEPORT AUTO-EXECUTE ====================
 local function armAutoExecute(showLog)
-    -- Try capturing clipboard again if user copied v5 script
-    pcall(function()
-        local getclip = getclipboard or fromclipboard
-        if getclip and writefile then
-            local clip = getclip()
-            if type(clip) == "string" and clip:find("__CAM_TD_OBSIDIAN_V5", 1, true) and #clip > 1000 then
-                writefile(AUTOEXEC_FILE, clip)
-            end
-        end
-    end)
-
-    local qFunc = queueonteleport
-        or queue_on_teleport
+    local qFunc = queue_on_teleport
+        or queueonteleport
         or (syn and syn.queue_on_teleport)
         or (fluxus and fluxus.queue_on_teleport)
-        or (ENV and (ENV.queueonteleport or ENV.queue_on_teleport))
+        or (delta and delta.queue_on_teleport)
+        or (ENV and (ENV.queue_on_teleport or ENV.queueonteleport))
 
     if not qFunc then
-        if showLog then addLog("Executor missing queueonteleport", true) end
+        if showLog then addLog("Executor missing queue_on_teleport", true) end
         return false
     end
 
-    -- Always clear any previously queued old v4.7 scripts first!
-    clearOldTeleportQueue()
-
-    -- Only execute v5 Obsidian script (never execute old v4.7 from GitHub)
-    local payload = string.format([[
-        if not game:IsLoaded() then game.Loaded:Wait() end
-        local ok, src = pcall(function()
-            return game:HttpGet(%q .. "?t=" .. tostring(os.time()))
-        end)
-        if ok and type(src) == "string" and src:find("__CAM_TD_OBSIDIAN_V5", 1, true) then
-            if writefile then pcall(writefile, %q, src) end
-            local fn = loadstring(src)
-            if fn then task.spawn(fn) return end
-        end
-        if isfile and readfile and isfile(%q) then
-            local cached = readfile(%q)
-            if type(cached) == "string" and #cached > 100 then
-                local fn = loadstring(cached)
+    if not S.teleportQueued then
+        local payload = string.format([[
+            if not game:IsLoaded() then game.Loaded:Wait() end
+            local ok, src = pcall(function()
+                return game:HttpGet(%q .. "?t=" .. tostring(os.time()))
+            end)
+            if ok and type(src) == "string" and #src > 100 then
+                if writefile then pcall(writefile, %q, src) end
+                local fn = loadstring(src)
+                if fn then task.spawn(fn) return end
+            end
+            if isfile and readfile and isfile(%q) then
+                local fn = loadstring(readfile(%q))
                 if fn then task.spawn(fn) end
             end
-        end
-    ]], GITHUB_URL, AUTOEXEC_FILE, AUTOEXEC_FILE, AUTOEXEC_FILE)
+        ]], GITHUB_URL, AUTOEXEC_FILE, AUTOEXEC_FILE, AUTOEXEC_FILE)
 
-    local ok, err = pcall(qFunc, payload)
-    if ok then
-        S.teleportQueued = true
+        local ok, err = pcall(qFunc, payload)
+        if ok then
+            S.teleportQueued = true
+            if showLog then
+                addLog("✅ Auto-Execute Armed (GitHub Live + Cache)!")
+                notify("Auto-Execute", "Armed for next teleport!", 3)
+            end
+            return true
+        else
+            if showLog then addLog("❌ Auto-Exec Error: " .. tostring(err), true) end
+            return false
+        end
+    else
         if showLog then
-            local hasLocalCache = (isfile and isfile(AUTOEXEC_FILE)) and "Local v5 Cache Ready" or "Copy script once to cache locally"
-            addLog("Auto-Execute Armed (" .. hasLocalCache .. ")!")
-            notify("Auto-Execute Armed", "Cleared old queue & armed v5.1 (" .. hasLocalCache .. ")", 3)
+            addLog("✅ Auto-Execute is already armed for teleport!")
+            notify("Auto-Execute", "Already armed for teleport!", 3)
         end
         return true
-    else
-        if showLog then addLog("Auto-Exec Error: " .. tostring(err), true) end
-        return false
     end
 end
 
 if S.autoExecute then
     armAutoExecute(false)
-else
-    clearOldTeleportQueue()
 end
 
 trackConn(LP.OnTeleport:Connect(function()
-    if S.autoExecute then
+    if S.autoExecute and not S.teleportQueued then
         armAutoExecute(false)
-    else
-        clearOldTeleportQueue()
     end
 end))
 
@@ -509,7 +468,6 @@ local function dismissLobbyLoadingScreen()
     end)
 end
 
--- Dynamic Map & Crate Discovery (Clean strings without < >)
 local function getAvailableLobbyMaps()
     local maps, seen = {}, {}
     local defaultMaps = { "Toilet City", "Desert", "Cameraman HQ" }
@@ -808,7 +766,7 @@ local function resolveUnitIdForTower(towerName, fallbackId)
 end
 
 -- ==================== 9. MACRO RECORDING & REPLAY ENGINE ====================
-local recData = { version = 5.1, actions = {} }
+local recData = { version = 5.2, actions = {} }
 local TowerIdToPlacementIndex = {}
 local recordedTowerLevels = {}
 local recordedSoldTowers = {}
@@ -932,10 +890,12 @@ end
 if not ENV.__CAM_TD_NAMECALL_HOOKED and hookmetamethod and getnamecallmethod then
     ENV.__CAM_TD_NAMECALL_HOOKED = true
     pcall(function()
+        local wrapClosure = newcclosure or function(f) return f end
+        local isCaller = checkcaller or function() return false end
         local oldNamecall
-        oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+        oldNamecall = hookmetamethod(game, "__namecall", wrapClosure(function(self, ...)
             local method = getnamecallmethod()
-            if not checkcaller() and typeof(self) == "Instance" and (method == "FireServer" or method == "fireServer") then
+            if not isCaller() and typeof(self) == "Instance" and (method == "FireServer" or method == "fireServer") then
                 if self.Name == "TowerAdd" and ENV.__CAM_TD_HOOK_CB then
                     local args = { ... }
                     task.spawn(function() pcall(ENV.__CAM_TD_HOOK_CB, args[1]) end)
@@ -1331,8 +1291,8 @@ end
 
 -- ==================== 10. BUILD OBSIDIAN WINDOW & TABS ====================
 local Window = Library:CreateWindow({
-    Title = "⚡ CAMERA TD // STUDIO v5.1",
-    Footer = "v5.1 Obsidian Edition | Lobby & Match",
+    Title = "⚡ CAMERA TD // STUDIO v5.2",
+    Footer = "v5.2 Obsidian Edition | Lobby & Match",
     Position = UDim2.fromOffset(28, 70),
     Size = UDim2.fromOffset(660, 490),
     NotifySide = "Right",
@@ -1344,7 +1304,6 @@ local Window = Library:CreateWindow({
     ToggleKeybind = Enum.KeyCode.RightControl
 })
 
--- Order tabs dynamically so Lobby Auto is first in Lobby, and Macro Studio is first In-Game
 local Tabs = {}
 if isInLobby() then
     Tabs.Lobby    = Window:AddTab("Lobby Auto", "compass")
@@ -1892,15 +1851,13 @@ ExecGroup:AddToggle("AutoExecuteToggle", {
         saveS()
         if Value then
             armAutoExecute(true)
-        else
-            clearOldTeleportQueue()
         end
     end
 })
 
 ExecGroup:AddSlider("StartupDelaySlider", {
     Text = "Startup Load Delay",
-    Default = tonumber(S.startupDelay) or 3,
+    Default = tonumber(S.startupDelay) or 7,
     Min = 1,
     Max = 60,
     Rounding = 0,
@@ -2046,7 +2003,7 @@ end)
 
 -- ==================== 11. ENGINE LINKER (LOBBY & MATCH) ====================
 task.spawn(function()
-    addLog("Initializing Camera TD Engine (v5.1 Obsidian)...")
+    addLog("Initializing Camera TD Engine (v5.2 Obsidian)...")
     pcall(function() loadMacroByName(S.macroName) end)
     updateMacroTimelineUI()
 
@@ -2230,7 +2187,7 @@ task.spawn(function()
     end
 end)
 
--- ==================== 13. LOBBY AUTO-JOIN MATCH LOOP (COUNTDOWN + 4-PAD) ====================
+-- ==================== 13. LOBBY AUTO-JOIN MATCH LOOP (COUNTDOWN + 4-PAD + VERIFIED START) ====================
 task.spawn(function()
     local activeElevatorName = nil
 
@@ -2243,6 +2200,24 @@ task.spawn(function()
                 if leaveRf then
                     leaveRf:InvokeServer(toLeave)
                 end
+            end)
+        end
+    end
+
+    local function triggerStartElevator(elevName, startRf)
+        -- 1. Try firing ReadyButton UI signal if visible
+        pcall(function()
+            local pg = LP:FindFirstChildOfClass("PlayerGui")
+            local qf = pg and pg:FindFirstChild("ElevatorGui") and pg.ElevatorGui:FindFirstChild("QueueFrame")
+            local readyBtn = qf and qf:FindFirstChild("ReadyButton")
+            if readyBtn and readyBtn.Visible and firesignal then
+                firesignal(readyBtn.Activated)
+            end
+        end)
+        -- 2. Invoke ElevatorStart remote directly
+        if startRf and elevName then
+            pcall(function()
+                startRf:InvokeServer(elevName)
             end)
         end
     end
@@ -2322,7 +2297,7 @@ task.spawn(function()
                 end
 
                 local method = cleanStr(S.joinMethod or "Teleport")
-                local areaPart = elev:FindFirstChild("Area") or elev:FindFirstChild("BasePart") or elev.PrimaryPart
+                local areaPart = elev:FindFirstChild("Area") or elev:FindFirstChild("Hitbox") or elev:FindFirstChild("BasePart") or elev.PrimaryPart
 
                 setLabel(StatusLabels.Countdown, string.format(
                     "🚀 Joining %s (%s) via %s...",
@@ -2338,7 +2313,7 @@ task.spawn(function()
                     local okEnter, resEnter = pcall(function()
                         return enterRf:InvokeServer(elev.Name)
                     end)
-                    if okEnter and resEnter then
+                    if (okEnter and resEnter) or (tonumber(elev:GetAttribute("Host")) == LP.UserId) then
                         enteredOk = true
                         activeElevatorName = elev.Name
                     else
@@ -2347,26 +2322,42 @@ task.spawn(function()
                 end
 
                 if not enteredOk then
+                    -- Teleport character dead-center inside Area so the game's Elevators.luau detector sees us immediately
                     local char = LP.Character
                     local hrp = char and char:FindFirstChild("HumanoidRootPart")
                     if hrp and areaPart then
                         hrp.AssemblyLinearVelocity = Vector3.zero
                         hrp.AssemblyAngularVelocity = Vector3.zero
-                        hrp.CFrame = areaPart.CFrame * CFrame.new(0, 3, 0)
-                        task.wait(0.25)
+                        hrp.CFrame = areaPart.CFrame
                     end
 
-                    if not S.autoJoinMatch then
-                        leaveActiveElevator()
-                        return
+                    -- Wait up to 1.2s for the game's native RenderStepped detector to enter the elevator first
+                    local enterWaitStart = tick()
+                    while tick() - enterWaitStart < 1.2 and S.autoJoinMatch and Controller.Running do
+                        if tonumber(elev:GetAttribute("Host")) == LP.UserId then
+                            enteredOk = true
+                            activeElevatorName = elev.Name
+                            break
+                        end
+                        local pg = LP:FindFirstChildOfClass("PlayerGui")
+                        local qf = pg and pg:FindFirstChild("ElevatorGui") and pg.ElevatorGui:FindFirstChild("QueueFrame")
+                        if qf and qf.Visible then
+                            enteredOk = true
+                            activeElevatorName = elev.Name
+                            break
+                        end
+                        task.wait(0.1)
                     end
 
-                    local okEnter, resEnter = pcall(function()
-                        return enterRf:InvokeServer(elev.Name)
-                    end)
-                    if (okEnter and resEnter) or (tonumber(elev:GetAttribute("Host")) == LP.UserId) then
-                        enteredOk = true
-                        activeElevatorName = elev.Name
+                    -- If native detector didn't enter yet, invoke ElevatorEnter directly
+                    if not enteredOk and S.autoJoinMatch then
+                        local okEnter, resEnter = pcall(function()
+                            return enterRf:InvokeServer(elev.Name)
+                        end)
+                        if (okEnter and resEnter) or (tonumber(elev:GetAttribute("Host")) == LP.UserId) then
+                            enteredOk = true
+                            activeElevatorName = elev.Name
+                        end
                     end
                 end
 
@@ -2375,15 +2366,35 @@ task.spawn(function()
                     return
                 end
 
+                -- Wait up to 2.0s for server to confirm Host == LP.UserId before firing ElevatorStart
+                local hostConfirmStart = tick()
+                while tick() - hostConfirmStart < 2.0 and S.autoJoinMatch and Controller.Running do
+                    local hostId = tonumber(elev:GetAttribute("Host")) or 0
+                    if hostId == LP.UserId then
+                        break
+                    end
+                    task.wait(0.1)
+                end
+
+                -- Verify no other player hijacked the pad
                 local pCount = tonumber(elev:GetAttribute("Players")) or 0
                 local hostId = tonumber(elev:GetAttribute("Host")) or 0
                 if (hostId ~= 0 and hostId ~= LP.UserId) or pCount > 1 then
                     addLog(string.format("Pad %s occupied by another player! Switching pad...", elev.Name))
                     leaveActiveElevator()
-                    task.wait(0.5)
+                    task.wait(0.6)
                     return
                 end
 
+                -- Wait a brief 0.35s so RemoteSecurity rate-limit tokens are completely clear
+                task.wait(0.35)
+
+                if not S.autoJoinMatch then
+                    leaveActiveElevator()
+                    return
+                end
+
+                -- Apply Optional Modifiers if selected
                 if modRf and type(S.selectedModifiers) == "table" then
                     local modList = {}
                     for k, v in pairs(S.selectedModifiers) do
@@ -2391,22 +2402,24 @@ task.spawn(function()
                     end
                     if #modList > 0 then
                         pcall(function() modRf:InvokeServer(elev.Name, modList) end)
+                        task.wait(0.35)
                     end
                 end
 
-                pcall(function()
-                    startRf:InvokeServer(elev.Name)
-                end)
+                -- Trigger ElevatorStart (ReadyButton + ElevatorStart:InvokeServer)
+                triggerStartElevator(elev.Name, startRf)
+                local lastStartTry = tick()
 
                 setLabel(StatusLabels.Countdown, string.format(
                     "✅ Started %s (%s)! Teleporting to match...",
                     elev.Name,
                     targetMap
                 ))
-                addLog(string.format("✅ Started match on %s (%s)! Waiting for server teleport...", elev.Name, targetMap))
+                addLog(string.format("✅ Fired Start on %s (%s)! Waiting for teleport...", elev.Name, targetMap))
 
+                -- Keep player on pad and retry ElevatorStart every 3.2s (RemoteSecurity Delay = 3s) until teleported
                 local waitStart = tick()
-                while tick() - waitStart < 8.0 and Controller.Running and isInLobby() do
+                while tick() - waitStart < 12.0 and Controller.Running and isInLobby() do
                     if not S.autoJoinMatch then
                         leaveActiveElevator()
                         addLog("⏹ Left elevator queue (Auto-Join unchecked).")
@@ -2414,9 +2427,13 @@ task.spawn(function()
                     end
                     local char = LP.Character
                     local hrp = char and char:FindFirstChild("HumanoidRootPart")
-                    if hrp and areaPart and (hrp.Position - areaPart.Position).Magnitude > 8 then
+                    if hrp and areaPart and (hrp.Position - areaPart.Position).Magnitude > 6 then
                         hrp.AssemblyLinearVelocity = Vector3.zero
-                        hrp.CFrame = areaPart.CFrame * CFrame.new(0, 3, 0)
+                        hrp.CFrame = areaPart.CFrame
+                    end
+                    if tick() - lastStartTry >= 3.2 then
+                        lastStartTry = tick()
+                        triggerStartElevator(elev.Name, startRf)
                     end
                     task.wait(0.25)
                 end
@@ -2470,11 +2487,10 @@ task.spawn(function()
                                     speedFailCount += 1
                                     if speedFailCount >= 2 then
                                         if targetSpeed == 2 then
-                                            -- Try 1.5x fallback once before locking
                                             pcall(function() Remotes.ChangeSpeed:InvokeServer(1.5) end)
                                         end
                                         speedRejectedInMatch = true
-                                        addLog("Speed " .. tostring(targetSpeed) .. "x locked on this account (200 Wins / Pass required); stopped speed requests.")
+                                        addLog("Speed " .. tostring(targetSpeed) .. "x locked on this account; stopped speed requests.")
                                     end
                                 else
                                     speedFailCount = 0
@@ -2607,4 +2623,4 @@ task.spawn(function()
     end
 end)
 
-notify("Camera TD v5.1 Loaded", isInLobby() and "Lobby Mode Active!" or "In-Game Match Mode Active!", 4)
+notify("Camera TD v5.2 Loaded", isInLobby() and "Lobby Mode Active!" or "In-Game Match Mode Active!", 4)
