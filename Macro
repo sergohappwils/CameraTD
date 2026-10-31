@@ -190,6 +190,7 @@ local DEFAULTS = {
     selectedMap = "Toilet City",
     joinMethod = "Teleport",
     joinCountdown = 7,
+    useModifiers = false,
     selectedModifiers = {},
     autoSummon = false,
     summonCrate = "Basic Crate",
@@ -225,6 +226,42 @@ S.summonCrate = cleanStr(S.summonCrate)
 S.summonAmount = cleanStr(S.summonAmount)
 S.selectedMode = cleanStr(S.selectedMode)
 S.macroName = cleanStr(S.macroName)
+
+-- Normalize S.selectedModifiers so it works with both array and dictionary formats
+local function normalizeModifiersTable(rawMods)
+    local dict = {}
+    if type(rawMods) == "table" then
+        for k, v in pairs(rawMods) do
+            if type(k) == "number" and type(v) == "string" then
+                dict[v] = true
+            elseif type(k) == "string" and v == true then
+                dict[k] = true
+            end
+        end
+    end
+    return dict
+end
+
+local function modifiersDictToArray(dict)
+    local arr = {}
+    if type(dict) == "table" then
+        for k, v in pairs(dict) do
+            if type(k) == "string" and v == true then
+                table.insert(arr, k)
+            elseif type(k) == "number" and type(v) == "string" then
+                table.insert(arr, v)
+            end
+        end
+    end
+    table.sort(arr)
+    return arr
+end
+
+S.selectedModifiers = normalizeModifiersTable(S.selectedModifiers)
+if not S.useModifiers then
+    -- If Enable Modifiers toggle is off, ensure no stale modifiers remain active
+    S.selectedModifiers = {}
+end
 
 pcall(function()
     if S.syncSkipMultiAcc and isfile and readfile and isfile(SHARED_SKIP_FILE) then
@@ -400,6 +437,7 @@ local Remotes = {}
 local LobbyRemotes = {}
 local MatchEngineReady = false
 local LobbyEngineReady = false
+local activeElevatorName = nil
 
 local function isInLobby()
     if workspace:FindFirstChild("Elevators") ~= nil then
@@ -443,6 +481,28 @@ local function getNetworkRemote(name)
         end
     end)
     return found
+end
+
+-- Returns active modifiers list ONLY if Enable Modifiers toggle is ON and modifiers are selected in the UI
+local function getActiveUIModifiersList()
+    local modToggleOn = (Toggles and Toggles.UseModifiersToggle and Toggles.UseModifiersToggle.Value == true) or (S.useModifiers == true)
+    if not modToggleOn then
+        return {}
+    end
+    local uiVal = (Options and Options.ElevatorModifiersDropdown and Options.ElevatorModifiersDropdown.Value) or S.selectedModifiers
+    return modifiersDictToArray(uiVal)
+end
+
+-- Syncs current UI modifiers to the active elevator immediately (or clears them if disabled/empty)
+local function syncElevatorModifiersLive(elevName)
+    local targetElev = elevName or activeElevatorName
+    if not targetElev or not isInLobby() then return end
+    local modRf = LobbyRemotes.ElevatorSetModifiers or getNetworkRemote("ElevatorSetModifiers")
+    if not modRf then return end
+    local modList = getActiveUIModifiersList()
+    pcall(function()
+        modRf:InvokeServer(targetElev, modList)
+    end)
 end
 
 local loadingDismissedOnce = false
@@ -766,7 +826,7 @@ local function resolveUnitIdForTower(towerName, fallbackId)
 end
 
 -- ==================== 9. MACRO RECORDING & REPLAY ENGINE ====================
-local recData = { version = 5.2, actions = {} }
+local recData = { version = 5.3, actions = {} }
 local TowerIdToPlacementIndex = {}
 local recordedTowerLevels = {}
 local recordedSoldTowers = {}
@@ -1291,8 +1351,8 @@ end
 
 -- ==================== 10. BUILD OBSIDIAN WINDOW & TABS ====================
 local Window = Library:CreateWindow({
-    Title = "⚡ CAMERA TD // STUDIO v5.2",
-    Footer = "v5.2 Obsidian Edition | Lobby & Match",
+    Title = "⚡ CAMERA TD // STUDIO v5.3",
+    Footer = "v5.3 Obsidian Edition | Lobby & Match",
     Position = UDim2.fromOffset(28, 70),
     Size = UDim2.fromOffset(660, 490),
     NotifySide = "Right",
@@ -1357,19 +1417,70 @@ JoinGroup:AddDropdown("JoinMethodDropdown", {
     end
 })
 
+JoinGroup:AddToggle("UseModifiersToggle", {
+    Text = "Enable Match Modifiers",
+    Default = S.useModifiers == true,
+    Tooltip = "When OFF, modifiers are completely ignored and never applied to your match!",
+    Callback = function(Value)
+        S.useModifiers = Value
+        if not Value then
+            S.selectedModifiers = {}
+            if Options.ElevatorModifiersDropdown then
+                pcall(function() Options.ElevatorModifiersDropdown:SetValue({}) end)
+            end
+        end
+        saveS()
+        syncElevatorModifiersLive()
+    end
+})
+
+-- Pass an array (not dictionary) to Default so Obsidian's ipairs(Default) highlights active modifiers in UI
+local initialModifiersArray = S.useModifiers and modifiersDictToArray(S.selectedModifiers) or {}
 JoinGroup:AddDropdown("ElevatorModifiersDropdown", {
     Values = { "Hp_Mobs", "Speed_Mobs" },
-    Default = S.selectedModifiers or {},
+    Default = initialModifiersArray,
     Multi = true,
-    Text = "Modifiers (Optional)",
-    Tooltip = "Optional modifiers to apply before starting elevator",
+    Text = "Select Modifiers",
+    Tooltip = "Click to select or unselect modifiers (Requires 'Enable Match Modifiers' ON)",
     Callback = function(Value)
         if type(Value) == "table" then
-            S.selectedModifiers = Value
+            S.selectedModifiers = normalizeModifiersTable(Value)
             saveS()
+            syncElevatorModifiersLive()
         end
     end
 })
+
+JoinGroup:AddButton({
+    Text = "🧹 Clear Modifiers",
+    Func = function()
+        S.useModifiers = false
+        S.selectedModifiers = {}
+        if Toggles.UseModifiersToggle then
+            pcall(function() Toggles.UseModifiersToggle:SetValue(false) end)
+        end
+        if Options.ElevatorModifiersDropdown then
+            pcall(function() Options.ElevatorModifiersDropdown:SetValue({}) end)
+        end
+        saveS()
+        syncElevatorModifiersLive()
+        notify("Modifiers Cleared", "All match modifiers disabled & cleared.", 3)
+    end
+}):AddButton({
+    Text = "↻ Refresh Maps",
+    Func = function()
+        safeCall("RefreshMapList", function()
+            local maps = getAvailableLobbyMaps()
+            Options.SelectedMapDropdown:SetValues(maps)
+            if table.find(maps, S.selectedMap) then
+                Options.SelectedMapDropdown:SetValue(S.selectedMap)
+            end
+            notify("Maps Refreshed", "Found " .. tostring(#maps) .. " maps in Elevators.", 3)
+        end)
+    end
+})
+
+JoinGroup:AddDivider()
 
 JoinGroup:AddSlider("JoinCountdownSlider", {
     Text = "Join Countdown",
@@ -1394,20 +1505,6 @@ JoinGroup:AddToggle("AutoJoinMatchToggle", {
         if not Value then
             setLabel(StatusLabels.Countdown, "Join Timer: ⏹ Cancelled / Off")
         end
-    end
-})
-
-JoinGroup:AddButton({
-    Text = "↻ Refresh Map List",
-    Func = function()
-        safeCall("RefreshMapList", function()
-            local maps = getAvailableLobbyMaps()
-            Options.SelectedMapDropdown:SetValues(maps)
-            if table.find(maps, S.selectedMap) then
-                Options.SelectedMapDropdown:SetValue(S.selectedMap)
-            end
-            notify("Maps Refreshed", "Found " .. tostring(#maps) .. " maps in Elevators.", 3)
-        end)
     end
 })
 
@@ -2003,7 +2100,7 @@ end)
 
 -- ==================== 11. ENGINE LINKER (LOBBY & MATCH) ====================
 task.spawn(function()
-    addLog("Initializing Camera TD Engine (v5.2 Obsidian)...")
+    addLog("Initializing Camera TD Engine (v5.3 Obsidian)...")
     pcall(function() loadMacroByName(S.macroName) end)
     updateMacroTimelineUI()
 
@@ -2189,8 +2286,6 @@ end)
 
 -- ==================== 13. LOBBY AUTO-JOIN MATCH LOOP (COUNTDOWN + 4-PAD + VERIFIED START) ====================
 task.spawn(function()
-    local activeElevatorName = nil
-
     local function leaveActiveElevator()
         if activeElevatorName then
             local toLeave = activeElevatorName
@@ -2205,7 +2300,6 @@ task.spawn(function()
     end
 
     local function triggerStartElevator(elevName, startRf)
-        -- 1. Try firing ReadyButton UI signal if visible
         pcall(function()
             local pg = LP:FindFirstChildOfClass("PlayerGui")
             local qf = pg and pg:FindFirstChild("ElevatorGui") and pg.ElevatorGui:FindFirstChild("QueueFrame")
@@ -2214,7 +2308,6 @@ task.spawn(function()
                 firesignal(readyBtn.Activated)
             end
         end)
-        -- 2. Invoke ElevatorStart remote directly
         if startRf and elevName then
             pcall(function()
                 startRf:InvokeServer(elevName)
@@ -2225,14 +2318,19 @@ task.spawn(function()
     while Controller.Running do
         if isInLobby() then
             safeCall("LobbyAutoJoinLoop", function()
-                local targetMap = cleanStr(S.selectedMap or "Toilet City")
+                local targetMap = cleanStr((Options.SelectedMapDropdown and Options.SelectedMapDropdown.Value) or S.selectedMap or "Toilet City")
+                local activeMods = getActiveUIModifiersList()
+                local modText = (#activeMods > 0) and table.concat(activeMods, "+") or "None"
+
                 setLabel(StatusLabels.LobbyState, string.format(
-                    "Lobby Active | Coins: %d | Target Map: %s",
+                    "Lobby Active | Coins: %d | Map: %s | Mods: %s",
                     getLobbyCoins(),
-                    targetMap
+                    targetMap,
+                    modText
                 ))
 
-                if not S.autoJoinMatch then
+                local autoJoinOn = (Toggles.AutoJoinMatchToggle and Toggles.AutoJoinMatchToggle.Value == true)
+                if not autoJoinOn then
                     leaveActiveElevator()
                     return
                 end
@@ -2246,18 +2344,18 @@ task.spawn(function()
                 local cancelled = false
 
                 for rem = totalSec, 1, -1 do
-                    if not S.autoJoinMatch or not Controller.Running or not isInLobby() then
+                    if not (Toggles.AutoJoinMatchToggle and Toggles.AutoJoinMatchToggle.Value) or not Controller.Running or not isInLobby() then
                         cancelled = true
                         break
                     end
                     setLabel(StatusLabels.Countdown, string.format(
                         "⏳ Teleporting into %s in %ds... (Uncheck to cancel)",
-                        cleanStr(S.selectedMap),
+                        cleanStr((Options.SelectedMapDropdown and Options.SelectedMapDropdown.Value) or S.selectedMap),
                         rem
                     ))
                     local stepStart = tick()
                     while tick() - stepStart < 1.0 do
-                        if not S.autoJoinMatch or not Controller.Running or not isInLobby() then
+                        if not (Toggles.AutoJoinMatchToggle and Toggles.AutoJoinMatchToggle.Value) or not Controller.Running or not isInLobby() then
                             cancelled = true
                             break
                         end
@@ -2266,7 +2364,7 @@ task.spawn(function()
                     if cancelled then break end
                 end
 
-                if cancelled or not S.autoJoinMatch or not Controller.Running or not isInLobby() then
+                if cancelled or not (Toggles.AutoJoinMatchToggle and Toggles.AutoJoinMatchToggle.Value) or not Controller.Running or not isInLobby() then
                     leaveActiveElevator()
                     setLabel(StatusLabels.Countdown, "Join Timer: ⏹ Cancelled by user")
                     addLog("⏹ Auto-Join countdown cancelled.")
@@ -2274,7 +2372,7 @@ task.spawn(function()
                 end
 
                 -- 2. Find an empty pad for the selected map among the 4 pads
-                targetMap = cleanStr(S.selectedMap or "Toilet City")
+                targetMap = cleanStr((Options.SelectedMapDropdown and Options.SelectedMapDropdown.Value) or S.selectedMap or "Toilet City")
                 local elev = findEmptyElevatorForMap(targetMap)
 
                 if not elev then
@@ -2296,7 +2394,7 @@ task.spawn(function()
                     return
                 end
 
-                local method = cleanStr(S.joinMethod or "Teleport")
+                local method = cleanStr((Options.JoinMethodDropdown and Options.JoinMethodDropdown.Value) or S.joinMethod or "Teleport")
                 local areaPart = elev:FindFirstChild("Area") or elev:FindFirstChild("Hitbox") or elev:FindFirstChild("BasePart") or elev.PrimaryPart
 
                 setLabel(StatusLabels.Countdown, string.format(
@@ -2322,7 +2420,6 @@ task.spawn(function()
                 end
 
                 if not enteredOk then
-                    -- Teleport character dead-center inside Area so the game's Elevators.luau detector sees us immediately
                     local char = LP.Character
                     local hrp = char and char:FindFirstChild("HumanoidRootPart")
                     if hrp and areaPart then
@@ -2331,9 +2428,8 @@ task.spawn(function()
                         hrp.CFrame = areaPart.CFrame
                     end
 
-                    -- Wait up to 1.2s for the game's native RenderStepped detector to enter the elevator first
                     local enterWaitStart = tick()
-                    while tick() - enterWaitStart < 1.2 and S.autoJoinMatch and Controller.Running do
+                    while tick() - enterWaitStart < 1.2 and (Toggles.AutoJoinMatchToggle and Toggles.AutoJoinMatchToggle.Value) and Controller.Running do
                         if tonumber(elev:GetAttribute("Host")) == LP.UserId then
                             enteredOk = true
                             activeElevatorName = elev.Name
@@ -2349,8 +2445,7 @@ task.spawn(function()
                         task.wait(0.1)
                     end
 
-                    -- If native detector didn't enter yet, invoke ElevatorEnter directly
-                    if not enteredOk and S.autoJoinMatch then
+                    if not enteredOk and (Toggles.AutoJoinMatchToggle and Toggles.AutoJoinMatchToggle.Value) then
                         local okEnter, resEnter = pcall(function()
                             return enterRf:InvokeServer(elev.Name)
                         end)
@@ -2361,14 +2456,14 @@ task.spawn(function()
                     end
                 end
 
-                if not S.autoJoinMatch then
+                if not (Toggles.AutoJoinMatchToggle and Toggles.AutoJoinMatchToggle.Value) then
                     leaveActiveElevator()
                     return
                 end
 
                 -- Wait up to 2.0s for server to confirm Host == LP.UserId before firing ElevatorStart
                 local hostConfirmStart = tick()
-                while tick() - hostConfirmStart < 2.0 and S.autoJoinMatch and Controller.Running do
+                while tick() - hostConfirmStart < 2.0 and (Toggles.AutoJoinMatchToggle and Toggles.AutoJoinMatchToggle.Value) and Controller.Running do
                     local hostId = tonumber(elev:GetAttribute("Host")) or 0
                     if hostId == LP.UserId then
                         break
@@ -2386,23 +2481,23 @@ task.spawn(function()
                     return
                 end
 
-                -- Wait a brief 0.35s so RemoteSecurity rate-limit tokens are completely clear
                 task.wait(0.35)
 
-                if not S.autoJoinMatch then
+                if not (Toggles.AutoJoinMatchToggle and Toggles.AutoJoinMatchToggle.Value) then
                     leaveActiveElevator()
                     return
                 end
 
-                -- Apply Optional Modifiers if selected
-                if modRf and type(S.selectedModifiers) == "table" then
-                    local modList = {}
-                    for k, v in pairs(S.selectedModifiers) do
-                        if v == true then table.insert(modList, k) end
-                    end
+                -- Apply or Clear Modifiers based strictly on current UI state!
+                if modRf then
+                    local modList = getActiveUIModifiersList()
                     if #modList > 0 then
                         pcall(function() modRf:InvokeServer(elev.Name, modList) end)
+                        addLog("Applied Modifiers: " .. table.concat(modList, ", "))
                         task.wait(0.35)
+                    else
+                        -- Explicitly clear any modifiers on the elevator if disabled in UI
+                        pcall(function() modRf:InvokeServer(elev.Name, {}) end)
                     end
                 end
 
@@ -2417,10 +2512,9 @@ task.spawn(function()
                 ))
                 addLog(string.format("✅ Fired Start on %s (%s)! Waiting for teleport...", elev.Name, targetMap))
 
-                -- Keep player on pad and retry ElevatorStart every 3.2s (RemoteSecurity Delay = 3s) until teleported
                 local waitStart = tick()
                 while tick() - waitStart < 12.0 and Controller.Running and isInLobby() do
-                    if not S.autoJoinMatch then
+                    if not (Toggles.AutoJoinMatchToggle and Toggles.AutoJoinMatchToggle.Value) then
                         leaveActiveElevator()
                         addLog("⏹ Left elevator queue (Auto-Join unchecked).")
                         break
@@ -2473,8 +2567,9 @@ task.spawn(function()
                 end
 
                 if MatchEngineReady then
-                    -- 1. Smart Game Speed Enforcer (Never spams "You need 200 wins"!)
-                    if S.autoSpeed and isPlaying and Remotes.ChangeSpeed and not speedRejectedInMatch then
+                    -- 1. Smart Game Speed Enforcer
+                    local autoSpeedOn = (Toggles.AutoSpeedToggle and Toggles.AutoSpeedToggle.Value == true)
+                    if autoSpeedOn and isPlaying and Remotes.ChangeSpeed and not speedRejectedInMatch then
                         local curSpeed = tonumber(workspace:GetAttribute("GameSpeed")) or 1
                         local targetSpeed = tonumber(S.speedChoice) or 2
                         if curSpeed ~= targetSpeed then
@@ -2501,9 +2596,10 @@ task.spawn(function()
                         end
                     end
 
-                    -- 2. Gamemode Auto-Vote
-                    if S.autoVoteMode and isVoting and Remotes.ModeVote then
-                        local modeClean = cleanStr(S.selectedMode)
+                    -- 2. Gamemode Auto-Vote (Only votes if Auto Vote Gamemode toggle is ON in UI)
+                    local autoVoteOn = (Toggles.AutoVoteModeToggle and Toggles.AutoVoteModeToggle.Value == true)
+                    if autoVoteOn and isVoting and Remotes.ModeVote then
+                        local modeClean = cleanStr((Options.VoteModeDropdown and Options.VoteModeDropdown.Value) or S.selectedMode)
                         local votersRaw = workspace:GetAttribute(modeClean .. "Voters")
                         local alreadyVoted = false
                         if votersRaw and votersRaw ~= "" then
@@ -2519,7 +2615,8 @@ task.spawn(function()
                     end
 
                     -- 3. Wave Skip Enforcer
-                    if S.autoSkip and isPlaying and Remotes.WaveSkip then
+                    local autoSkipOn = (Toggles.AutoSkipToggle and Toggles.AutoSkipToggle.Value == true)
+                    if autoSkipOn and isPlaying and Remotes.WaveSkip then
                         if workspace:GetAttribute("CanSkip") == true then
                             if isWaveSkipBlocked(curWave, S.noSkipWaves) then
                                 if lastBlockedWaveLog ~= curWave then
@@ -2539,7 +2636,8 @@ task.spawn(function()
                         if S.autoExecute and not S.teleportQueued then
                             armAutoExecute(false)
                         end
-                        if S.autoReplay and Remotes.PlayAgain and not hasVotedPlayAgain() then
+                        local autoReplayOn = (Toggles.AutoReplayToggle and Toggles.AutoReplayToggle.Value == true)
+                        if autoReplayOn and Remotes.PlayAgain and not hasVotedPlayAgain() then
                             if tick() - lastPlayAgainAttempt >= 1.0 then
                                 lastPlayAgainAttempt = tick()
                                 pcall(function() Remotes.PlayAgain:FireServer() end)
@@ -2559,11 +2657,12 @@ task.spawn(function()
                     end
 
                     -- 6. AutoPlay Trigger on Wave >= 1
-                    if S.autoPlay and isPlaying and curWave >= 1 and not S.replaying and not S.recording and not S.macroPlayed then
+                    local autoPlayOn = (Toggles.AutoPlayMacroToggle and Toggles.AutoPlayMacroToggle.Value == true)
+                    if autoPlayOn and isPlaying and curWave >= 1 and not S.replaying and not S.recording and not S.macroPlayed then
                         S.macroPlayed = true
                         task.spawn(function()
                             task.wait(1.2)
-                            if S.autoPlay and isMatchActive() and not S.replaying and Controller.Running then
+                            if (Toggles.AutoPlayMacroToggle and Toggles.AutoPlayMacroToggle.Value) and isMatchActive() and not S.replaying and Controller.Running then
                                 local d = S.macro
                                 if not d or not d.actions or #d.actions == 0 then
                                     loadMacroByName(S.macroName)
@@ -2623,4 +2722,4 @@ task.spawn(function()
     end
 end)
 
-notify("Camera TD v5.2 Loaded", isInLobby() and "Lobby Mode Active!" or "In-Game Match Mode Active!", 4)
+notify("Camera TD v5.3 Loaded", isInLobby() and "Lobby Mode Active!" or "In-Game Match Mode Active!", 4)
