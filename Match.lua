@@ -1,11 +1,11 @@
 -- ============================================================================
--- CAMERA TD // MATCH & MACRO STUDIO MODULE (Match.lua v5.5)
+-- CAMERA TD // MATCH STUDIO MODULE (Match.lua v5.7)
 -- Fixes:
---   1. Fixed MacroCtrlGroup:AddButton row pair syntax
---   2. Instant Zero-Yield Remote Linking (Works on Arceus X Mobile & PC immediately)
---   3. Real-Time Disk Auto-Save on Every Action (Never loses recorded macros)
---   4. Single-Click Mobile-Friendly Delete (Removes from disk, UI & _settings.json)
---   5. 100% Dynamic Game Config Prices + Persistent Godly Upgrade Loop
+--   1. Fixed tonumber(str:gsub(...)) 2nd return value bug ('base out of range')
+--      that crashed Upgrade Recording & ReplayStep!
+--   2. Wrapped all MacroFileSelect:SetValues / :SetValue with suppressDropdownCallback
+--   3. Added `if suppressDropdownCallback or S.recording then return end` guard
+--   4. Dynamic Game Config Prices + Persistent Godly ($27k) Upgrade Loop
 -- ============================================================================
 
 if not game:IsLoaded() then
@@ -57,7 +57,7 @@ local function trackConn(conn)
     return conn
 end
 
--- ==================== 2. SERVICES & LOGGING ====================
+-- ==================== 2. SERVICES & SAFE PARSING HELPERS ====================
 local Players     = game:GetService("Players")
 local RS          = game:GetService("ReplicatedStorage")
 local HttpService = game:GetService("HttpService")
@@ -89,6 +89,15 @@ local lastLabelTexts = {}
 local function cleanStr(val)
     if type(val) ~= "string" then return tostring(val or "") end
     return val:gsub("^<%s*", ""):gsub("%s*>$", ""):match("^%s*(.-)%s*$") or ""
+end
+
+-- Safe base-10 integer parser (discards 2nd return value of gsub so tonumber never errors with 'base out of range')
+local function parseDigits(val)
+    if type(val) == "number" then return val end
+    if type(val) ~= "string" then return nil end
+    local digits = val:gsub("[^%d]", "")
+    if digits == "" then return nil end
+    return tonumber(digits, 10)
 end
 
 local function setLabel(labelObj, text)
@@ -161,7 +170,7 @@ local function loadJSON(path)
     return (ok and type(res) == "table") and res or nil
 end
 
-local function getRawMacroFiles()
+local function listMacroFiles()
     local names, seen = {}, {}
     pcall(function()
         if listfiles and isfolder and isfolder(MACRO_FOLDER) then
@@ -175,11 +184,6 @@ local function getRawMacroFiles()
         end
     end)
     table.sort(names)
-    return names
-end
-
-local function listMacroFiles()
-    local names = getRawMacroFiles()
     if #names == 0 then
         table.insert(names, "Farm")
     end
@@ -189,7 +193,8 @@ end
 local bootDelay = 7
 pcall(function()
     if isfile and readfile and isfile(DELAY_FILE) then
-        local num = tonumber(readfile(DELAY_FILE):match("([%d%.]+)"))
+        local matchStr = readfile(DELAY_FILE):match("([%d%.]+)")
+        local num = matchStr and tonumber(matchStr, 10)
         if num and num >= 1 and num <= 60 then bootDelay = num end
     end
 end)
@@ -237,13 +242,6 @@ S.summonAmount = cleanStr(S.summonAmount)
 S.selectedMode = cleanStr(S.selectedMode)
 S.macroName    = cleanStr(S.macroName)
 
-local existingDiskMacros = getRawMacroFiles()
-if #existingDiskMacros > 0 and not table.find(existingDiskMacros, S.macroName) then
-    S.macroName = existingDiskMacros[1]
-elseif #existingDiskMacros == 0 and S.macroName == "" then
-    S.macroName = "Farm"
-end
-
 pcall(function()
     if S.syncSkipMultiAcc and isfile and readfile and isfile(SHARED_SKIP_FILE) then
         local sharedFilter = readfile(SHARED_SKIP_FILE)
@@ -251,7 +249,7 @@ pcall(function()
     end
 end)
 
--- Runtime state
+-- Runtime state (non-saved)
 S.recording        = false
 S.replaying        = false
 S.paused           = false
@@ -290,7 +288,7 @@ safeCall("LoadObsidianLibrary", function()
 end)
 
 if not Library then
-    warn("[CameraTD] Critical: Could not load Obsidian Library.")
+    warn("[CameraTD] Critical: Could not load Obsidian Library from GitHub.")
     return
 end
 
@@ -309,7 +307,7 @@ local function notify(title, desc, duration)
     end)
 end
 
--- ==================== 5. TELEPORT AUTO-EXECUTE & ANTI-IDLE ====================
+-- ==================== 5. GITHUB + TELEPORT AUTO-EXECUTE ====================
 local function armAutoExecute(showLog)
     local qFunc = queue_on_teleport
         or queueonteleport
@@ -355,7 +353,7 @@ local function armAutoExecute(showLog)
         end
     else
         if showLog then
-            addLog("✅ Auto-Execute is already armed!")
+            addLog("✅ Auto-Execute is already armed for teleport!")
             notify("Auto-Execute", "Already armed for teleport!", 3)
         end
         return true
@@ -406,7 +404,7 @@ task.spawn(function()
     end
 end)
 
--- ==================== 6. DYNAMIC GAME CONFIG LOADER & ECONOMY HELPERS ====================
+-- ==================== 6. IN-GAME STATE & DYNAMIC CONFIG HELPERS ====================
 local playerGui        = LP:FindFirstChildOfClass("PlayerGui")
 local gameUI           = playerGui and playerGui:FindFirstChild("GameUI")
 local gameFolder       = workspace:FindFirstChild("Game")
@@ -416,32 +414,31 @@ local ConfigModule     = nil
 local ConfigTowers     = {}
 local Remotes          = {}
 local MatchEngineReady = false
-local LiveTowersById   = {}
 
-local function syncGameTowerConfigs()
+-- Dynamically loads Tower Configs from shared.Modules.Config AND ReplicatedStorage.ModuleLoader.Configs.Config.Towers
+local function loadDynamicTowerConfigs()
     pcall(function()
         if shared and shared.Modules and type(shared.Modules.Config) == "table" then
             ConfigModule = shared.Modules.Config
             if type(ConfigModule.Towers) == "table" then
-                for name, data in pairs(ConfigModule.Towers) do
-                    ConfigTowers[name] = data
+                for k, v in pairs(ConfigModule.Towers) do
+                    ConfigTowers[k] = v
                 end
             end
         end
     end)
-
     pcall(function()
         local ml = RS:FindFirstChild("ModuleLoader")
         local cfgs = ml and ml:FindFirstChild("Configs")
-        local cfgMod = cfgs and cfgs:FindFirstChild("Config")
-        local towersDir = cfgMod and cfgMod:FindFirstChild("Towers")
-        if towersDir then
-            for _, desc in ipairs(towersDir:GetDescendants()) do
+        local cfgScript = cfgs and cfgs:FindFirstChild("Config")
+        local towersRoot = cfgScript and cfgScript:FindFirstChild("Towers")
+        if towersRoot then
+            for _, desc in ipairs(towersRoot:GetDescendants()) do
                 if desc:IsA("ModuleScript") and not ConfigTowers[desc.Name] then
                     task.spawn(function()
-                        local ok, tData = pcall(require, desc)
-                        if ok and type(tData) == "table" and type(tData.Upgrades) == "table" then
-                            ConfigTowers[desc.Name] = tData
+                        local ok, mod = pcall(require, desc)
+                        if ok and type(mod) == "table" and type(mod.Upgrades) == "table" then
+                            ConfigTowers[desc.Name] = mod
                         end
                     end)
                 end
@@ -449,7 +446,7 @@ local function syncGameTowerConfigs()
         end
     end)
 end
-task.spawn(syncGameTowerConfigs)
+task.spawn(loadDynamicTowerConfigs)
 
 local function isWaveSkipBlocked(wave, filterStr)
     if not wave or wave <= 0 then return false end
@@ -460,7 +457,7 @@ local function isWaveSkipBlocked(wave, filterStr)
         if s ~= "" then
             local rStart, rEnd = s:match("^(%d+)%s*%-%s*(%d+)$")
             if rStart and rEnd then
-                local a, b = tonumber(rStart), tonumber(rEnd)
+                local a, b = tonumber(rStart, 10), tonumber(rEnd, 10)
                 if a and b then
                     if a > b then a, b = b, a end
                     if wave >= a and wave <= b then return true end
@@ -468,10 +465,10 @@ local function isWaveSkipBlocked(wave, filterStr)
             else
                 local plusWave = s:match("^(%d+)%s*%+$")
                 if plusWave then
-                    local a = tonumber(plusWave)
+                    local a = tonumber(plusWave, 10)
                     if a and wave >= a then return true end
                 else
-                    local single = tonumber(s)
+                    local single = tonumber(s, 10)
                     if single and wave == single then return true end
                 end
             end
@@ -506,7 +503,7 @@ local function getCash()
         and gameUI.Stats.OtherUI:FindFirstChild("Money")
         and gameUI.Stats.OtherUI.Money:FindFirstChild("Title")
     if title and title:IsA("TextLabel") and title.Text ~= "" then
-        local val = tonumber(title.Text:gsub("[^%d]", ""))
+        local val = parseDigits(title.Text)
         if val then return val end
     end
     return 0
@@ -566,31 +563,6 @@ local function getDistanceXZ(pos1, pos2)
     return math.sqrt((pos1.X - pos2.X)^2 + (pos1.Z - pos2.Z)^2)
 end
 
-local function getSlotSignMultiplier(towerName)
-    local tData = ConfigTowers[towerName]
-    local basePlace = tData and tData.Upgrades and tData.Upgrades[1] and tonumber(tData.Upgrades[1].Price)
-    if not basePlace or basePlace <= 0 then return 1 end
-    if not gameUI then
-        playerGui = LP:FindFirstChildOfClass("PlayerGui")
-        gameUI = playerGui and playerGui:FindFirstChild("GameUI")
-    end
-    for slot = 1, 5 do
-        if LP:GetAttribute("Slot" .. slot) == towerName then
-            local slotGui = gameUI and gameUI:FindFirstChild("Slots") and gameUI.Slots:FindFirstChild("Slot" .. slot)
-            local pLbl = slotGui and slotGui:FindFirstChild("TroopFrame") and slotGui.TroopFrame:FindFirstChild("Price")
-            if pLbl and pLbl:IsA("TextLabel") and pLbl.Text ~= "" then
-                local slotPrice = tonumber(pLbl.Text:gsub("[^%d]", ""))
-                if slotPrice and slotPrice > 0 and slotPrice < basePlace then
-                    local ratio = slotPrice / basePlace
-                    if math.abs(ratio - 0.8) < 0.03 then return 0.8 end
-                    if math.abs(ratio - 0.9) < 0.03 then return 0.9 end
-                end
-            end
-        end
-    end
-    return 1
-end
-
 local function getTowerPlacementCost(towerName, recordedCost)
     if not gameUI then
         playerGui = LP:FindFirstChildOfClass("PlayerGui")
@@ -600,16 +572,15 @@ local function getTowerPlacementCost(towerName, recordedCost)
         if LP:GetAttribute("Slot" .. slot) == towerName then
             local slotGui = gameUI and gameUI:FindFirstChild("Slots") and gameUI.Slots:FindFirstChild("Slot" .. slot)
             local pLbl = slotGui and slotGui:FindFirstChild("TroopFrame") and slotGui.TroopFrame:FindFirstChild("Price")
-            if pLbl and pLbl:IsA("TextLabel") and pLbl.Text ~= "" then
-                local num = tonumber(pLbl.Text:gsub("[^%d]", ""))
+            if pLbl and pLbl:IsA("TextLabel") then
+                local num = parseDigits(pLbl.Text)
                 if num and num > 0 then return num end
             end
         end
     end
     local tData = ConfigTowers[towerName]
     if tData and tData.Upgrades and tData.Upgrades[1] and tData.Upgrades[1].Price then
-        local basePrice = tonumber(tData.Upgrades[1].Price) or 100
-        return math.floor(basePrice * getSlotSignMultiplier(towerName))
+        return tonumber(tData.Upgrades[1].Price) or 100
     end
     if recordedCost and tonumber(recordedCost) and tonumber(recordedCost) > 0 then
         return tonumber(recordedCost)
@@ -617,12 +588,34 @@ local function getTowerPlacementCost(towerName, recordedCost)
     return 100
 end
 
+-- Checks live ConfigTowers[towerName].Upgrades[nextLevel].Price FIRST using safe parseDigits!
 local function getTowerUpgradeCost(towerName, nextLevel, recordedCost)
     local tData = ConfigTowers[towerName]
     if tData and tData.Upgrades and tData.Upgrades[nextLevel] and tData.Upgrades[nextLevel].Price then
-        local basePrice = tonumber(tData.Upgrades[nextLevel].Price)
-        if basePrice and basePrice > 0 then
-            return math.floor(basePrice * getSlotSignMultiplier(towerName))
+        local livePrice = tonumber(tData.Upgrades[nextLevel].Price)
+        if livePrice and livePrice > 0 then
+            local basePlace = tData.Upgrades[1] and tonumber(tData.Upgrades[1].Price)
+            if basePlace and basePlace > 0 then
+                if not gameUI then
+                    playerGui = LP:FindFirstChildOfClass("PlayerGui")
+                    gameUI = playerGui and playerGui:FindFirstChild("GameUI")
+                end
+                for slot = 1, 5 do
+                    if LP:GetAttribute("Slot" .. slot) == towerName then
+                        local slotGui = gameUI and gameUI:FindFirstChild("Slots") and gameUI.Slots:FindFirstChild("Slot" .. slot)
+                        local pLbl = slotGui and slotGui:FindFirstChild("TroopFrame") and slotGui.TroopFrame:FindFirstChild("Price")
+                        if pLbl and pLbl:IsA("TextLabel") then
+                            local slotPrice = parseDigits(pLbl.Text)
+                            if slotPrice and slotPrice > 0 and slotPrice < basePlace then
+                                local ratio = slotPrice / basePlace
+                                if math.abs(ratio - 0.8) < 0.03 then return math.floor(livePrice * 0.8) end
+                                if math.abs(ratio - 0.9) < 0.03 then return math.floor(livePrice * 0.9) end
+                            end
+                        end
+                    end
+                end
+            end
+            return livePrice
         end
     end
     if recordedCost and tonumber(recordedCost) and tonumber(recordedCost) > 0 then
@@ -634,25 +627,17 @@ local function getTowerUpgradeCost(towerName, nextLevel, recordedCost)
     return 200
 end
 
-local function getTowerMaxLevel(towerName)
-    local tData = ConfigTowers[towerName]
-    if tData and type(tData.Upgrades) == "table" then
-        return #tData.Upgrades
-    end
-    return 99
-end
-
 local function resolveUnitIdForTower(towerName, fallbackId)
     for slot = 1, 5 do
         local sName = LP:GetAttribute("Slot" .. slot)
-        local sId   = LP:GetAttribute("Slot" .. slot .. "Id")
+        local sId = LP:GetAttribute("Slot" .. slot .. "Id")
         if sName == towerName and type(sId) == "string" and sId ~= "" then
             return sId
         end
     end
     local foundId = nil
     pcall(function()
-        if shared and shared.Modules and shared.Modules.Replication and type(shared.Modules.Replication.GetCurrentReplica) == "function" then
+        if shared and shared.Modules and shared.Modules.Replication and shared.Modules.Replication.GetCurrentReplica then
             local rep = shared.Modules.Replication.GetCurrentReplica()
             if rep and rep.Data and rep.Data.Towers then
                 for id, data in pairs(rep.Data.Towers) do
@@ -668,35 +653,29 @@ local function resolveUnitIdForTower(towerName, fallbackId)
 end
 
 -- ==================== 7. MACRO RECORDING & REPLAY ENGINE ====================
-local recData                 = { version = 5.5, actions = {} }
-local TowerIdToPlacementIndex = {}
-local recordedTowerLevels     = {}
-local recordedSoldTowers      = {}
-local recordedTowerModes      = {}
-local pendingUnitIds          = {}
-local lastPlaceTime           = 0
-local lastPlacePos            = Vector3.zero
+local recData                  = { version = 5.7, actions = {} }
+local TowerIdToPlacementIndex  = {}
+local recordedTowerLevels      = {}
+local recordedSoldTowers       = {}
+local recordedTowerModes       = {}
+local pendingUnitIds           = {}
+local lastPlaceTime            = 0
+local lastPlacePos             = Vector3.zero
 
-local ReplayTowers            = {}
-local UsedTowerIds            = {}
-local ActiveTowerLevels       = {}
-local ActiveTowerModes        = {}
-local PendingReplayPlace      = nil
+local ReplayTowers             = {}
+local UsedTowerIds             = {}
+local ActiveTowerLevels        = {}
+local ActiveTowerModes         = {}
+local suppressDropdownCallback = false
 
 local function getLiveTowerLevel(tId)
     if not tId then return 1 end
     tId = tostring(tId)
     local bestLvl = ActiveTowerLevels[tId] or 1
 
-    local ld = LiveTowersById[tId]
-    if ld and tonumber(ld.Level) and tonumber(ld.Level) > bestLvl then
-        bestLvl = tonumber(ld.Level)
-        ActiveTowerLevels[tId] = bestLvl
-    end
-
     pcall(function()
         if shared and shared.Modules and shared.Modules.GameReplicator and shared.Modules.GameReplicator.Data and shared.Modules.GameReplicator.Data.Towers then
-            local entry = shared.Modules.GameReplicator.Data.Towers[tId] or shared.Modules.GameReplicator.Data.Towers[tonumber(tId)]
+            local entry = shared.Modules.GameReplicator.Data.Towers[tId] or shared.Modules.GameReplicator.Data.Towers[tonumber(tId, 10)]
             if entry and tonumber(entry.Level) and tonumber(entry.Level) > bestLvl then
                 bestLvl = tonumber(entry.Level)
                 ActiveTowerLevels[tId] = bestLvl
@@ -713,7 +692,7 @@ local function getLiveTowerLevel(tId)
         local statusGui = model and model:FindFirstChild("TroopStatus", true)
         local lvlLabel = statusGui and statusGui:FindFirstChild("TroopLevel")
         if lvlLabel and lvlLabel:IsA("TextLabel") and lvlLabel.Text ~= "" then
-            local parsed = tonumber(lvlLabel.Text:match("(%d+)"))
+            local parsed = parseDigits(lvlLabel.Text)
             if parsed and parsed > bestLvl then
                 bestLvl = parsed
                 ActiveTowerLevels[tId] = bestLvl
@@ -722,21 +701,6 @@ local function getLiveTowerLevel(tId)
     end)
 
     return bestLvl
-end
-
-local function getActiveProfileName()
-    local inputVal = Options and Options.MacroNameInput and cleanStr(Options.MacroNameInput.Value)
-    if inputVal and inputVal ~= "" then
-        return inputVal
-    end
-    local dropVal = Options and Options.MacroFileSelect and cleanStr(Options.MacroFileSelect.Value)
-    if dropVal and dropVal ~= "" then
-        return dropVal
-    end
-    if S.macroName and S.macroName ~= "" then
-        return S.macroName
-    end
-    return "Farm"
 end
 
 local function updateMacroTimelineUI()
@@ -783,52 +747,35 @@ local function updateMacroTimelineUI()
     end)
 end
 
-local function repairMacroActions(actions)
-    if type(actions) ~= "table" then return end
-    local idxToTower = {}
-    for _, act in ipairs(actions) do
-        if act.type == "place" and act.placementIndex and act.towerName then
-            idxToTower[act.placementIndex] = act.towerName
-            if ConfigTowers[act.towerName] then
-                act.cost = getTowerPlacementCost(act.towerName, act.cost)
-            end
-        elseif act.type == "upgrade" and act.placementIndex then
-            if (not act.towerName or act.towerName == "" or act.towerName == "Unknown") and idxToTower[act.placementIndex] then
-                act.towerName = idxToTower[act.placementIndex]
-            end
-            if act.towerName and ConfigTowers[act.towerName] then
-                act.cost = getTowerUpgradeCost(act.towerName, act.targetLevel or 2, act.cost)
-            end
-        end
-    end
-end
-
 local function syncMacroFromRec(name)
-    name = cleanStr(name or getActiveProfileName())
     S.macro = { name = name, date = os.date(), actions = table.clone(recData.actions) }
     updateMacroTimelineUI()
 end
 
+-- Helper that safely updates MacroFileSelect with suppressDropdownCallback = true/false
 local function autoFlushRecordingToDisk()
     if not S.recording or #recData.actions == 0 then return end
-    local profName = getActiveProfileName()
+    local profName = cleanStr((Options and Options.MacroNameInput and Options.MacroNameInput.Value) or S.macroName or "Farm")
+    if profName == "" then profName = "Farm" end
     S.macroName = profName
     S.macro = { name = profName, date = os.date(), actions = table.clone(recData.actions) }
     if S.autoSaveRec then
         saveS()
         saveJSON(MACRO_FOLDER .. "/" .. profName .. ".json", S.macro)
         if Options and Options.MacroFileSelect then
+            suppressDropdownCallback = true
             pcall(function()
                 local list = listMacroFiles()
                 Options.MacroFileSelect:SetValues(list)
                 Options.MacroFileSelect:SetValue(profName)
             end)
+            suppressDropdownCallback = false
         end
     end
 end
 
 local function saveCurrentMacro(name)
-    name = cleanStr(name or getActiveProfileName())
+    name = cleanStr(name or (Options and Options.MacroNameInput and Options.MacroNameInput.Value) or S.macroName or "Farm")
     if name == "" then name = "Farm" end
     local actionsToSave = (#recData.actions > 0 and recData.actions) or (S.macro and S.macro.actions) or {}
     if #actionsToSave == 0 then
@@ -836,7 +783,6 @@ local function saveCurrentMacro(name)
         notify("Macro Save", "Cannot save an empty macro (0 actions)!", 3)
         return false
     end
-    repairMacroActions(actionsToSave)
     S.macroName = name
     saveS()
     local payload = { name = name, date = os.date(), actions = table.clone(actionsToSave) }
@@ -844,20 +790,17 @@ local function saveCurrentMacro(name)
     recData.actions = table.clone(actionsToSave)
     local ok = saveJSON(MACRO_FOLDER .. "/" .. name .. ".json", payload)
     updateMacroTimelineUI()
-    if Options then
+    if Options and Options.MacroFileSelect then
+        suppressDropdownCallback = true
         pcall(function()
-            if Options.MacroNameInput then Options.MacroNameInput:SetValue(name) end
-            if Options.MacroFileSelect then
-                Options.MacroFileSelect:SetValues(listMacroFiles())
-                Options.MacroFileSelect:SetValue(name)
-            end
+            Options.MacroFileSelect:SetValues(listMacroFiles())
+            Options.MacroFileSelect:SetValue(name)
         end)
+        suppressDropdownCallback = false
     end
     if ok then
-        addLog(string.format("💾 Saved '%s' (%d actions)", name, #actionsToSave))
+        addLog(string.format("Saved '%s' (%d actions)", name, #actionsToSave))
         notify("Macro Saved", string.format("Saved '%s' (%d actions)", name, #actionsToSave), 3)
-    else
-        addLog("Failed to write macro file to disk!", true)
     end
     return ok
 end
@@ -866,35 +809,30 @@ local function loadMacroByName(name)
     name = cleanStr(name or S.macroName or "Farm")
     if name == "" then return false end
     local d = loadJSON(MACRO_FOLDER .. "/" .. name .. ".json")
-    if not (d and type(d.actions) == "table") then
-        local diskFiles = getRawMacroFiles()
-        if #diskFiles > 0 and table.find(diskFiles, name) == nil then
-            local fallbackName = diskFiles[1]
-            local fd = loadJSON(MACRO_FOLDER .. "/" .. fallbackName .. ".json")
-            if fd and type(fd.actions) == "table" then
-                name = fallbackName
-                d = fd
-            end
-        end
-    end
     if d and type(d.actions) == "table" then
-        repairMacroActions(d.actions)
         S.macro = d
         recData.actions = table.clone(d.actions)
         S.macroName = name
         saveS()
         if Options then
-            pcall(function()
-                if Options.MacroNameInput and cleanStr(Options.MacroNameInput.Value) ~= name then
-                    Options.MacroNameInput:SetValue(name)
-                end
-                if Options.MacroFileSelect and cleanStr(Options.MacroFileSelect.Value) ~= name then
+            if Options.MacroNameInput then
+                pcall(function()
+                    if cleanStr(Options.MacroNameInput.Value) ~= name then
+                        Options.MacroNameInput:SetValue(name)
+                    end
+                end)
+            end
+            if Options.MacroFileSelect then
+                suppressDropdownCallback = true
+                pcall(function()
+                    Options.MacroFileSelect:SetValues(listMacroFiles())
                     Options.MacroFileSelect:SetValue(name)
-                end
-            end)
+                end)
+                suppressDropdownCallback = false
+            end
         end
         updateMacroTimelineUI()
-        addLog(string.format("📂 Loaded macro '%s' (%d actions)", name, #d.actions))
+        addLog(string.format("Loaded macro '%s' (%d actions)", name, #d.actions))
         return true
     end
     return false
@@ -934,31 +872,15 @@ if not ENV.__CAM_TD_NAMECALL_HOOKED and hookmetamethod and getnamecallmethod the
 end
 
 local function bindMatchRemoteListeners()
-    if Remotes.Replication then
-        trackConn(Remotes.Replication.OnClientEvent:Connect(function(state)
-            if type(state) == "table" and type(state.Towers) == "table" then
-                for k, v in pairs(state.Towers) do
-                    local id = tostring((type(v) == "table" and (v.Id or v.Index)) or k)
-                    LiveTowersById[id] = v
-                    if type(v) == "table" and tonumber(v.Level) then
-                        ActiveTowerLevels[id] = tonumber(v.Level)
-                    end
-                end
-            end
-        end))
-    end
-
     if Remotes.TowerAdd then
         trackConn(Remotes.TowerAdd.OnClientEvent:Connect(function(data)
             safeCall("TowerAddListener", function()
                 local rawId = data and (data.Id or data.Index)
                 if not rawId then return end
-                local tId = tostring(rawId)
-                LiveTowersById[tId] = data
-
                 local isMine = (data.OwnerUserId == LP.UserId) or (data.OwnerName == LP.Name)
                 if not isMine or not data.Pos then return end
 
+                local tId   = tostring(rawId)
                 local tName = tostring(data.Name or "Tower")
                 local pos   = data.Pos
                 local rawCf = data.CFrame or CFrame.new(pos)
@@ -986,15 +908,7 @@ local function bindMatchRemoteListeners()
                 end
 
                 if S.replaying then
-                    ActiveTowerLevels[tId] = tonumber(data.Level) or 1
-                    if PendingReplayPlace and not UsedTowerIds[tId] then
-                        if PendingReplayPlace.towerName == tName and getDistanceXZ(PendingReplayPlace.pos, pos) < 3.5 then
-                            local pIdx = PendingReplayPlace.placementIndex
-                            ReplayTowers[pIdx] = tId
-                            UsedTowerIds[tId]  = pIdx
-                            return
-                        end
-                    end
+                    ActiveTowerLevels[tId] = 1
                     if S.macro and S.macro.actions and not UsedTowerIds[tId] then
                         for _, act in ipairs(S.macro.actions) do
                             if act.type == "place" and act.pos and not ReplayTowers[act.placementIndex] then
@@ -1019,12 +933,7 @@ local function bindMatchRemoteListeners()
                 if not rawId then return end
                 local tId = tostring(rawId)
                 local lvl = tonumber(data.Level)
-                if lvl then
-                    ActiveTowerLevels[tId] = lvl
-                    if LiveTowersById[tId] then
-                        LiveTowersById[tId].Level = lvl
-                    end
-                end
+                if S.replaying and lvl then ActiveTowerLevels[tId] = lvl end
 
                 if S.recording then
                     local pIdx = TowerIdToPlacementIndex[tId]
@@ -1064,19 +973,16 @@ local function bindMatchRemoteListeners()
     if removeEvent then
         trackConn(removeEvent.OnClientEvent:Connect(function(data)
             safeCall("TowerRemoveListener", function()
-                local rawId = data and (data.Id or data.Index)
-                if not rawId then return end
-                local tId = tostring(rawId)
-                LiveTowersById[tId] = nil
-                if S.recording then
-                    local pIdx = TowerIdToPlacementIndex[tId]
-                    if pIdx and not recordedSoldTowers[tId] then
-                        recordedSoldTowers[tId] = true
-                        table.insert(recData.actions, { type = "sell", placementIndex = pIdx, towerId = tId })
-                        autoFlushRecordingToDisk()
-                        updateMacroTimelineUI()
-                        addLog(string.format("[REC] Sold Unit #%d", pIdx))
-                    end
+                if not S.recording then return end
+                local tId = data and (data.Id and tostring(data.Id) or (data.Index and tostring(data.Index)))
+                if not tId then return end
+                local pIdx = TowerIdToPlacementIndex[tId]
+                if pIdx and not recordedSoldTowers[tId] then
+                    recordedSoldTowers[tId] = true
+                    table.insert(recData.actions, { type = "sell", placementIndex = pIdx, towerId = tId })
+                    autoFlushRecordingToDisk()
+                    updateMacroTimelineUI()
+                    addLog(string.format("[REC] Sold Unit #%d", pIdx))
                 end
             end)
         end))
@@ -1085,9 +991,8 @@ local function bindMatchRemoteListeners()
     if Remotes.TowerTarget then
         trackConn(Remotes.TowerTarget.OnClientEvent:Connect(function(data)
             safeCall("TowerTargetListener", function()
-                local rawId = data and (data.Id or data.Index)
-                if not rawId or not data.TargetMode then return end
-                local tId     = tostring(rawId)
+                if not data or not (data.Id or data.Index) or not data.TargetMode then return end
+                local tId     = tostring(data.Id or data.Index)
                 local newMode = tostring(data.TargetMode)
                 ActiveTowerModes[tId] = newMode
                 if S.recording then
@@ -1109,38 +1014,6 @@ local function bindMatchRemoteListeners()
         end))
     end
 end
-
-local function tryLinkMatchRemotesNow()
-    if MatchEngineReady then return true end
-    local ml  = RS:FindFirstChild("ModuleLoader")
-    local sh  = ml and ml:FindFirstChild("Shared")
-    local net = sh and sh:FindFirstChild("Network")
-    local re  = net and net:FindFirstChild("RemoteEvent")
-    local rf  = net and net:FindFirstChild("RemoteFunction")
-
-    if re and rf then
-        Remotes.Replication  = re:FindFirstChild("Replication")
-        Remotes.TowerAdd     = re:FindFirstChild("TowerAdd")
-        Remotes.TowerUpgrade = re:FindFirstChild("TowerUpgrade")
-        Remotes.TowerSell    = re:FindFirstChild("TowerSell")
-        Remotes.TowerTarget  = re:FindFirstChild("TowerTarget")
-        Remotes.TowerRemove  = re:FindFirstChild("TowerRemove")
-        Remotes.ModeVote     = re:FindFirstChild("ModeVote")
-        Remotes.WaveSkip     = re:FindFirstChild("WaveSkip")
-        Remotes.PlayAgain    = re:FindFirstChild("PlayAgain")
-        Remotes.ChangeSpeed  = rf:FindFirstChild("ChangeSpeed")
-
-        if Remotes.TowerAdd and Remotes.TowerUpgrade then
-            bindMatchRemoteListeners()
-            if S.disableVFX then applyVFXSetting(true) end
-            MatchEngineReady = true
-            addLog("✅ Match Remotes Linked!")
-            return true
-        end
-    end
-    return false
-end
-pcall(tryLinkMatchRemotesNow)
 
 local function findPlacedTowerModelByPos(targetPos, maxDist, excludeUsed)
     if not towersFolder then
@@ -1195,9 +1068,6 @@ local function executeReplay(macroData)
         return
     end
 
-    task.spawn(syncGameTowerConfigs)
-    repairMacroActions(macroData.actions)
-
     if not isMatchActive() then
         addLog("Replay queued: Waiting for Wave 1...")
         setMatchStatusText("⏳ Awaiting Wave 1...")
@@ -1211,7 +1081,6 @@ local function executeReplay(macroData)
     table.clear(UsedTowerIds)
     table.clear(ActiveTowerLevels)
     table.clear(ActiveTowerModes)
-    PendingReplayPlace = nil
     S.replaying        = true
     S.paused           = false
     S.skipCurrentStep  = false
@@ -1255,7 +1124,7 @@ local function executeReplay(macroData)
                 end
                 local cf = CFrame.new(targetPos) * CFrame.Angles(0, yawRad, 0)
 
-                local existing = findPlacedTowerModelByPos(targetPos, 1.6, true)
+                local existing = findPlacedTowerModelByPos(targetPos, 1.8, true)
                 if existing then
                     ReplayTowers[a.placementIndex]   = existing.Name
                     UsedTowerIds[existing.Name]      = a.placementIndex
@@ -1264,25 +1133,15 @@ local function executeReplay(macroData)
                 end
 
                 local cost   = getTowerPlacementCost(a.towerName, a.cost)
-                local status = awaitCashAndPause(cost, "Place " .. tostring(a.towerName))
+                local status = awaitCashAndPause(cost, "Place " .. a.towerName)
                 if status == "ABORT" then S.replaying = false return end
                 if status == "SKIP" then return end
 
                 local unitId = resolveUnitIdForTower(a.towerName, a.unitId)
-                PendingReplayPlace = {
-                    placementIndex = a.placementIndex,
-                    towerName      = a.towerName,
-                    pos            = targetPos
-                }
-
                 local placed, attempts = false, 0
-                while not placed and attempts < 12 and S.replaying and isMatchActive() and Controller.Running do
+
+                while not placed and attempts < 10 and S.replaying and isMatchActive() and Controller.Running do
                     if S.skipCurrentStep then S.skipCurrentStep = false break end
-
-                    local wStat = awaitCashAndPause(cost, "Place " .. tostring(a.towerName))
-                    if wStat == "ABORT" then S.replaying = false break end
-                    if wStat == "SKIP" then break end
-
                     if Remotes.TowerAdd then
                         pcall(function()
                             Remotes.TowerAdd:FireServer({ Name = a.towerName, UnitId = unitId, Pos = targetPos, CFrame = cf })
@@ -1291,7 +1150,7 @@ local function executeReplay(macroData)
                     local startWait = tick()
                     while tick() - startWait < 1.4 and S.replaying and isMatchActive() do
                         if ReplayTowers[a.placementIndex] then placed = true break end
-                        local found = findPlacedTowerModelByPos(targetPos, 2.5, true)
+                        local found = findPlacedTowerModelByPos(targetPos, 2.8, true)
                         if found then
                             ReplayTowers[a.placementIndex] = found.Name
                             UsedTowerIds[found.Name]       = a.placementIndex
@@ -1303,11 +1162,10 @@ local function executeReplay(macroData)
                     end
                     attempts += 1
                 end
-                PendingReplayPlace = nil
                 if placed then
-                    addLog(string.format("Placed: %s (#%d)", tostring(a.towerName), a.placementIndex))
+                    addLog(string.format("Placed: %s (#%d)", a.towerName, a.placementIndex))
                 else
-                    addLog(string.format("Place Failed: %s (#%d)", tostring(a.towerName), a.placementIndex), true)
+                    addLog(string.format("Place Failed: %s (#%d)", a.towerName, a.placementIndex), true)
                 end
                 task.wait(0.1)
 
@@ -1343,13 +1201,13 @@ local function executeReplay(macroData)
                         end
                     end
                     towerName = towerName or "Scientist Cameraman"
-                    local maxLvl     = getTowerMaxLevel(towerName)
                     local currentLvl = getLiveTowerLevel(tId)
-                    local targetLvl  = math.min(a.targetLevel or (currentLvl + 1), maxLvl)
+                    local targetLvl  = a.targetLevel or (currentLvl + 1)
                     if currentLvl >= targetLvl then return end
 
                     local cost = getTowerUpgradeCost(towerName, targetLvl, a.cost)
 
+                    -- Persistent upgrade loop so Godly $27,000 upgrade never times out after 6 attempts!
                     local upgraded = false
                     while not upgraded and S.replaying and isMatchActive() and Controller.Running do
                         if S.skipCurrentStep then S.skipCurrentStep = false break end
@@ -1361,32 +1219,19 @@ local function executeReplay(macroData)
                         if status == "SKIP" then return end
 
                         pcall(function() Remotes.TowerUpgrade:FireServer({ Id = tId }) end)
-
                         local waitStart = tick()
-                        while tick() - waitStart < 1.4 and S.replaying and isMatchActive() do
-                            if getLiveTowerLevel(tId) >= targetLvl then
-                                upgraded = true
-                                break
-                            end
+                        while tick() - waitStart < 1.8 and S.replaying and isMatchActive() do
+                            if getLiveTowerLevel(tId) >= targetLvl then upgraded = true break end
                             task.wait(0.05)
                         end
-
-                        if not upgraded and getCash() < (cost * 0.5) then
+                        if not upgraded and getCash() < (cost - 10) then
                             local graceStart = tick()
-                            while tick() - graceStart < 1.8 and S.replaying and isMatchActive() do
-                                if getLiveTowerLevel(tId) >= targetLvl then
-                                    upgraded = true
-                                    break
-                                end
-                                task.wait(0.08)
+                            while tick() - graceStart < 2.0 and S.replaying and isMatchActive() do
+                                if getLiveTowerLevel(tId) >= targetLvl then upgraded = true break end
+                                task.wait(0.1)
                             end
                         end
-
-                        if not upgraded then
-                            task.wait(0.15)
-                        end
                     end
-
                     if upgraded then
                         ActiveTowerLevels[tId] = targetLvl
                         addLog(string.format("Upgraded: #%d (%s) -> Lvl %d", a.placementIndex, towerName, targetLvl))
@@ -1424,7 +1269,6 @@ local function executeReplay(macroData)
         end)
     end
 
-    PendingReplayPlace = nil
     S.replaying        = false
     S.paused           = false
     S.currentStepIndex = 0
@@ -1436,8 +1280,8 @@ end
 
 -- ==================== 8. BUILD OBSIDIAN WINDOW & TABS ====================
 local Window = Library:CreateWindow({
-    Title                = "⚡ CAMERA TD // STUDIO v5.5",
-    Footer               = "v5.5 Obsidian Edition | Live Save & Fix",
+    Title                = "⚡ CAMERA TD // STUDIO v5.7",
+    Footer               = "v5.7 Obsidian Edition | Match Studio",
     Position             = UDim2.fromOffset(28, 70),
     Size                 = UDim2.fromOffset(660, 490),
     NotifySide           = "Right",
@@ -1484,12 +1328,10 @@ MacroCtrlGroup:AddDropdown("MacroFileSelect", {
     Multi    = false,
     Text     = "Saved Macro Files",
     Callback = function(Value)
+        if suppressDropdownCallback or S.recording then return end
         local clean = cleanStr(Value)
         if clean ~= "" then
             S.macroName = clean
-            if Options.MacroNameInput then
-                pcall(function() Options.MacroNameInput:SetValue(clean) end)
-            end
             loadMacroByName(clean)
         end
     end
@@ -1499,25 +1341,23 @@ MacroCtrlGroup:AddButton({
     Text = "💾 Save",
     Func = function()
         safeCall("SaveMacroBtn", function()
-            local targetName = getActiveProfileName()
-            saveCurrentMacro(targetName)
+            saveCurrentMacro(Options.MacroNameInput and Options.MacroNameInput.Value or S.macroName)
         end)
     end
 }):AddButton({
     Text = "📂 Load",
     Func = function()
         safeCall("LoadMacroBtn", function()
-            local selectedDrop = Options.MacroFileSelect and cleanStr(Options.MacroFileSelect.Value)
-            local inputName    = Options.MacroNameInput and cleanStr(Options.MacroNameInput.Value)
-            local target       = (selectedDrop and selectedDrop ~= "" and isfile and isfile(MACRO_FOLDER .. "/" .. selectedDrop .. ".json") and selectedDrop)
-                or (inputName and inputName ~= "" and isfile and isfile(MACRO_FOLDER .. "/" .. inputName .. ".json") and inputName)
-                or selectedDrop
-                or inputName
-                or S.macroName
+            local target = Options.MacroNameInput and Options.MacroNameInput.Value or S.macroName
             if loadMacroByName(target) then
-                notify("Macro Loaded", "Loaded profile: " .. tostring(S.macroName), 3)
+                notify("Macro Loaded", "Loaded profile: " .. tostring(target), 3)
             else
-                notify("Macro Load Failed", "File not found: " .. tostring(target), 3)
+                local dropTarget = Options.MacroFileSelect and cleanStr(Options.MacroFileSelect.Value)
+                if dropTarget and dropTarget ~= "" and loadMacroByName(dropTarget) then
+                    notify("Macro Loaded", "Loaded profile: " .. tostring(dropTarget), 3)
+                else
+                    notify("Macro Load Failed", "File not found: " .. tostring(target), 3)
+                end
             end
         end)
     end
@@ -1528,77 +1368,51 @@ MacroCtrlGroup:AddButton({
     Func = function()
         safeCall("RefreshMacrosBtn", function()
             local list = listMacroFiles()
-            Options.MacroFileSelect:SetValues(list)
-            notify("Macro Files", "Found " .. tostring(#getRawMacroFiles()) .. " macro files.", 2)
+            suppressDropdownCallback = true
+            pcall(function()
+                Options.MacroFileSelect:SetValues(list)
+                Options.MacroFileSelect:SetValue(S.macroName)
+            end)
+            suppressDropdownCallback = false
+            notify("Macro Files", "Found " .. tostring(#list) .. " macro files.", 2)
         end)
     end
 }):AddButton({
     Text    = "🗑 Delete",
-    Tooltip = "Deletes the selected macro JSON file from disk & memory",
+    Tooltip = "Click to delete current macro JSON file",
     Func = function()
         safeCall("DeleteMacroBtn", function()
-            local dropTarget  = Options.MacroFileSelect and cleanStr(Options.MacroFileSelect.Value)
-            local inputTarget = Options.MacroNameInput and cleanStr(Options.MacroNameInput.Value)
-            local deletedAny  = false
-            local deletedName = dropTarget ~= "" and dropTarget or inputTarget
-
+            local n = cleanStr(Options.MacroNameInput and Options.MacroNameInput.Value or S.macroName)
+            local d = cleanStr(Options.MacroFileSelect and Options.MacroFileSelect.Value or "")
+            local deletedName = nil
             if delfile and isfile then
-                for _, candidate in ipairs({ dropTarget, inputTarget, S.macroName }) do
-                    if candidate and candidate ~= "" then
-                        local p = MACRO_FOLDER .. "/" .. candidate .. ".json"
-                        if isfile(p) then
-                            pcall(delfile, p)
-                            deletedAny  = true
-                            deletedName = candidate
-                        end
-                    end
-                end
-                if listfiles and isfolder and isfolder(MACRO_FOLDER) then
-                    for _, file in ipairs(listfiles(MACRO_FOLDER)) do
-                        local fNorm = tostring(file):gsub("\\", "/")
-                        local fName = fNorm:match("([^/]+)%.json$")
-                        if fName and (fName == dropTarget or fName == inputTarget) then
-                            pcall(delfile, file)
-                            deletedAny  = true
-                            deletedName = fName
-                        end
-                    end
+                if n ~= "" and isfile(MACRO_FOLDER .. "/" .. n .. ".json") then
+                    delfile(MACRO_FOLDER .. "/" .. n .. ".json")
+                    deletedName = n
+                elseif d ~= "" and isfile(MACRO_FOLDER .. "/" .. d .. ".json") then
+                    delfile(MACRO_FOLDER .. "/" .. d .. ".json")
+                    deletedName = d
                 end
             end
-
             recData.actions = {}
             S.macro = nil
-
-            local remaining = getRawMacroFiles()
-            local nextMacro = (#remaining > 0 and remaining[1]) or "Farm"
-            S.macroName = nextMacro
+            local list = listMacroFiles()
+            S.macroName = list[1] or "Farm"
             saveS()
-
-            local uiList = listMacroFiles()
-            if Options.MacroFileSelect then
-                pcall(function()
-                    Options.MacroFileSelect:SetValues(uiList)
-                    Options.MacroFileSelect:SetValue(nextMacro)
-                end)
-            end
+            suppressDropdownCallback = true
+            pcall(function()
+                Options.MacroFileSelect:SetValues(list)
+                Options.MacroFileSelect:SetValue(S.macroName)
+            end)
+            suppressDropdownCallback = false
             if Options.MacroNameInput then
-                pcall(function()
-                    Options.MacroNameInput:SetValue(nextMacro)
-                end)
+                pcall(function() Options.MacroNameInput:SetValue(S.macroName) end)
             end
-
-            if #remaining > 0 then
-                loadMacroByName(nextMacro)
-            else
-                updateMacroTimelineUI()
-            end
-
-            if deletedAny then
-                addLog("🗑 Deleted macro file: " .. tostring(deletedName))
-                notify("Macro Deleted", "Deleted '" .. tostring(deletedName) .. "'", 3)
-            else
-                addLog("🧹 Cleared macro profile: " .. tostring(deletedName))
-                notify("Macro Cleared", "Cleared '" .. tostring(deletedName) .. "'", 3)
+            loadMacroByName(S.macroName)
+            updateMacroTimelineUI()
+            if deletedName then
+                addLog("Deleted macro file: " .. deletedName)
+                notify("Deleted", "Deleted " .. deletedName .. ".json", 3)
             end
         end)
     end
@@ -1612,8 +1426,6 @@ MacroCtrlGroup:AddToggle("RecordMacroToggle", {
     Callback = function(Value)
         safeCall("RecordMacroToggle", function()
             if Value then
-                pcall(tryLinkMatchRemotesNow)
-                task.spawn(syncGameTowerConfigs)
                 if S.replaying then
                     S.replaying = false
                     if Toggles.ReplayMacroToggle then Toggles.ReplayMacroToggle:SetValue(false) end
@@ -1624,15 +1436,14 @@ MacroCtrlGroup:AddToggle("RecordMacroToggle", {
                 table.clear(recordedSoldTowers)
                 table.clear(recordedTowerModes)
                 recData.actions = {}
-                S.macro = nil
                 S.recording = true
                 updateMacroTimelineUI()
                 setMatchStatusText("⏺ RECORDING ACTIONS...")
-                addLog("⏺ RECORDING STARTED (Auto-Saving steps live)")
+                addLog("⏺ RECORDING STARTED")
             else
                 if not S.recording then return end
                 S.recording = false
-                local profName = getActiveProfileName()
+                local profName = (Options.MacroNameInput and Options.MacroNameInput.Value ~= "" and Options.MacroNameInput.Value) or S.macroName
                 syncMacroFromRec(profName)
                 setMatchStatusText(string.format("⏹ Recorded %d Actions", #recData.actions))
                 addLog(string.format("⏹ RECORDING STOPPED (%d Actions)", #recData.actions))
@@ -1662,7 +1473,7 @@ MacroCtrlGroup:AddToggle("ReplayMacroToggle", {
                 if Toggles.RecordMacroToggle then Toggles.RecordMacroToggle:SetValue(false) end
             end
             local d = S.macro
-            local profName = getActiveProfileName()
+            local profName = (Options.MacroNameInput and Options.MacroNameInput.Value ~= "" and Options.MacroNameInput.Value) or S.macroName
             if not d or not d.actions or #d.actions == 0 then
                 if #recData.actions > 0 then
                     syncMacroFromRec(profName)
@@ -1721,13 +1532,14 @@ MacroCtrlGroup:AddButton({
         local targetList = (#recData.actions > 0 and recData.actions) or (S.macro and S.macro.actions)
         if targetList and #targetList > 0 then
             table.remove(targetList)
-            syncMacroFromRec(getActiveProfileName())
+            syncMacroFromRec(S.macroName)
             if S.recording then autoFlushRecordingToDisk() end
             addLog("↩ Removed last action from macro.")
         end
     end
 }):AddButton({
-    Text = "🧹 Clear All",
+    Text        = "🧹 Clear All",
+    DoubleClick = true,
     Func = function()
         recData.actions = {}
         if S.macro then S.macro.actions = {} end
@@ -1863,7 +1675,9 @@ ExecGroup:AddToggle("AutoExecuteToggle", {
     Callback = function(Value)
         S.autoExecute = Value
         saveS()
-        if Value then armAutoExecute(true) end
+        if Value then
+            armAutoExecute(true)
+        end
     end
 })
 
@@ -1874,6 +1688,7 @@ ExecGroup:AddSlider("StartupDelaySlider", {
     Max      = 60,
     Rounding = 0,
     Suffix   = "s",
+    Tooltip  = "Wait time before executing script on join/teleport",
     Callback = function(Value)
         S.startupDelay = Value
         saveS()
@@ -1959,7 +1774,7 @@ MenuGroup:AddDropdown("DPIDropdown", {
     Default  = "100%",
     Text     = "UI Scale (DPI)",
     Callback = function(Value)
-        local num = tonumber((tostring(Value):gsub("%%", "")))
+        local num = parseDigits(tostring(Value))
         if num then
             pcall(function() Library:SetDPIScale(num) end)
         end
@@ -1981,9 +1796,14 @@ MenuGroup:AddButton({
 })
 
 pcall(function()
-    if ThemeManager then
+    if ThemeManager and SaveManager then
         ThemeManager:SetLibrary(Library)
+        SaveManager:SetLibrary(Library)
+        SaveManager:IgnoreThemeSettings()
+        SaveManager:SetIgnoreIndexes({ "MenuKeybind", "MacroNameInput", "MacroFileSelect" })
         ThemeManager:SetFolder(FOLDER)
+        SaveManager:SetFolder(FOLDER .. "/obsidian_configs")
+        SaveManager:BuildConfigSection(Tabs.Settings)
         ThemeManager:ApplyToTab(Tabs.Settings)
     end
 end)
@@ -2013,8 +1833,7 @@ end)
 
 -- ==================== 9. ENGINE LINKER & SUPERVISOR LOOP ====================
 task.spawn(function()
-    addLog("Initializing Camera TD Engine (v5.5)...")
-    pcall(tryLinkMatchRemotesNow)
+    addLog("Initializing Camera TD Engine (v5.7 Obsidian)...")
     pcall(function() loadMacroByName(S.macroName) end)
     updateMacroTimelineUI()
 
@@ -2025,12 +1844,35 @@ task.spawn(function()
             gameFolder   = workspace:FindFirstChild("Game")
             towersFolder = gameFolder and gameFolder:FindFirstChild("Towers")
 
-            if not MatchEngineReady then
-                tryLinkMatchRemotesNow()
+            if next(ConfigTowers) == nil then
+                task.spawn(loadDynamicTowerConfigs)
             end
 
-            if next(ConfigTowers) == nil then
-                task.spawn(syncGameTowerConfigs)
+            if not MatchEngineReady then
+                local ml  = RS:FindFirstChild("ModuleLoader")
+                local sh  = ml and ml:FindFirstChild("Shared")
+                local net = sh and sh:FindFirstChild("Network")
+                local re  = net and net:FindFirstChild("RemoteEvent")
+                local rf  = net and net:FindFirstChild("RemoteFunction")
+
+                if re and rf then
+                    Remotes.TowerAdd     = re:FindFirstChild("TowerAdd")
+                    Remotes.TowerUpgrade = re:FindFirstChild("TowerUpgrade")
+                    Remotes.TowerSell    = re:FindFirstChild("TowerSell")
+                    Remotes.TowerTarget  = re:FindFirstChild("TowerTarget")
+                    Remotes.TowerRemove  = re:FindFirstChild("TowerRemove")
+                    Remotes.ModeVote     = re:FindFirstChild("ModeVote")
+                    Remotes.WaveSkip     = re:FindFirstChild("WaveSkip")
+                    Remotes.PlayAgain    = re:FindFirstChild("PlayAgain")
+                    Remotes.ChangeSpeed  = rf:FindFirstChild("ChangeSpeed")
+
+                    if Remotes.TowerAdd and Remotes.TowerUpgrade then
+                        bindMatchRemoteListeners()
+                        if S.disableVFX then applyVFXSetting(true) end
+                        MatchEngineReady = true
+                        addLog("✅ Match Remotes & Tower Configs Linked!")
+                    end
+                end
             end
         end)
 
@@ -2128,7 +1970,7 @@ task.spawn(function()
                     end
                 end
 
-                -- 4. Verified Auto Play Again + Auto-Flush Recording on Match End
+                -- 4. Verified Auto Play Again
                 if isOver then
                     if S.recording and #recData.actions > 0 then
                         autoFlushRecordingToDisk()
@@ -2150,9 +1992,8 @@ task.spawn(function()
 
                 -- 5. Interruption Watchdog
                 if not isPlaying and S.replaying then
-                    S.replaying        = false
-                    S.paused           = false
-                    PendingReplayPlace = nil
+                    S.replaying = false
+                    S.paused    = false
                     table.clear(ReplayTowers)
                     table.clear(UsedTowerIds)
                     table.clear(ActiveTowerLevels)
@@ -2222,4 +2063,4 @@ task.spawn(function()
     end
 end)
 
-notify("Camera TD v5.5 Loaded", "In-Game Match Mode Active!", 4)
+notify("Camera TD v5.7 Loaded", "In-Game Match Mode Active!", 4)
