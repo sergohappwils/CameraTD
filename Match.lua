@@ -1,10 +1,11 @@
 -- ============================================================================
 -- CAMERA TD // MATCH & MACRO STUDIO MODULE (Match.lua v5.5)
 -- Fixes:
---   1. Instant Zero-Yield Remote Linking (Works on Arceus X Mobile & PC immediately)
---   2. Real-Time Disk Auto-Save on Every Action (Never loses recorded macros)
---   3. Single-Click Mobile-Friendly Delete (Removes from disk, UI & _settings.json)
---   4. 100% Dynamic Game Config Prices + Persistent Godly Upgrade Loop
+--   1. Fixed MacroCtrlGroup:AddButton row pair syntax
+--   2. Instant Zero-Yield Remote Linking (Works on Arceus X Mobile & PC immediately)
+--   3. Real-Time Disk Auto-Save on Every Action (Never loses recorded macros)
+--   4. Single-Click Mobile-Friendly Delete (Removes from disk, UI & _settings.json)
+--   5. 100% Dynamic Game Config Prices + Persistent Godly Upgrade Loop
 -- ============================================================================
 
 if not game:IsLoaded() then
@@ -160,7 +161,6 @@ local function loadJSON(path)
     return (ok and type(res) == "table") and res or nil
 end
 
--- Returns actual saved macro files (if none exist on disk, returns {"Farm"} for UI display)
 local function getRawMacroFiles()
     local names, seen = {}, {}
     pcall(function()
@@ -237,7 +237,6 @@ S.summonAmount = cleanStr(S.summonAmount)
 S.selectedMode = cleanStr(S.selectedMode)
 S.macroName    = cleanStr(S.macroName)
 
--- If saved macroName no longer exists on disk, automatically select the first existing macro file!
 local existingDiskMacros = getRawMacroFiles()
 if #existingDiskMacros > 0 and not table.find(existingDiskMacros, S.macroName) then
     S.macroName = existingDiskMacros[1]
@@ -419,7 +418,6 @@ local Remotes          = {}
 local MatchEngineReady = false
 local LiveTowersById   = {}
 
--- Dynamically loads Tower Configs from the game's ReplicatedStorage in non-blocking threads
 local function syncGameTowerConfigs()
     pcall(function()
         if shared and shared.Modules and type(shared.Modules.Config) == "table" then
@@ -811,7 +809,6 @@ local function syncMacroFromRec(name)
     updateMacroTimelineUI()
 end
 
--- Real-time silent disk flush on every recorded step so recorded macros are NEVER lost!
 local function autoFlushRecordingToDisk()
     if not S.recording or #recData.actions == 0 then return end
     local profName = getActiveProfileName()
@@ -869,7 +866,6 @@ local function loadMacroByName(name)
     name = cleanStr(name or S.macroName or "Farm")
     if name == "" then return false end
     local d = loadJSON(MACRO_FOLDER .. "/" .. name .. ".json")
-    -- If exact name wasn't found, check if any saved file on disk exists as fallback
     if not (d and type(d.actions) == "table") then
         local diskFiles = getRawMacroFiles()
         if #diskFiles > 0 and table.find(diskFiles, name) == nil then
@@ -1114,7 +1110,6 @@ local function bindMatchRemoteListeners()
     end
 end
 
--- Instant non-blocking remote linker (Runs immediately before UI even finishes!)
 local function tryLinkMatchRemotesNow()
     if MatchEngineReady then return true end
     local ml  = RS:FindFirstChild("ModuleLoader")
@@ -1548,7 +1543,6 @@ MacroCtrlGroup:AddButton({
             local deletedName = dropTarget ~= "" and dropTarget or inputTarget
 
             if delfile and isfile then
-                -- Delete both dropdown-selected file and input-named file if they exist
                 for _, candidate in ipairs({ dropTarget, inputTarget, S.macroName }) do
                     if candidate and candidate ~= "" then
                         local p = MACRO_FOLDER .. "/" .. candidate .. ".json"
@@ -1559,7 +1553,6 @@ MacroCtrlGroup:AddButton({
                         end
                     end
                 end
-                -- Also check listfiles for exact match (handles Cyrillic/special chars on Android)
                 if listfiles and isfolder and isfolder(MACRO_FOLDER) then
                     for _, file in ipairs(listfiles(MACRO_FOLDER)) do
                         local fNorm = tostring(file):gsub("\\", "/")
@@ -1573,11 +1566,9 @@ MacroCtrlGroup:AddButton({
                 end
             end
 
-            -- Clear current memory actions
             recData.actions = {}
             S.macro = nil
 
-            -- Pick next remaining macro on disk or reset to "Farm"
             local remaining = getRawMacroFiles()
             local nextMacro = (#remaining > 0 and remaining[1]) or "Farm"
             S.macroName = nextMacro
@@ -1722,7 +1713,9 @@ MacroCtrlGroup:AddButton({
             addLog("⏭ Skipping current macro step...")
         end
     end
-}):AddButton({
+})
+
+MacroCtrlGroup:AddButton({
     Text = "↩ Undo Action",
     Func = function()
         local targetList = (#recData.actions > 0 and recData.actions) or (S.macro and S.macro.actions)
