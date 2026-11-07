@@ -1,11 +1,6 @@
 -- ============================================================================
--- CAMERA TD // MATCH & MACRO STUDIO MODULE (Match.lua v6.0)
--- Fixes:
---   1. Direct Config & Tower Module Loader (fixes $200 fallback when shared is isolated)
---   2. True Upgrade Cost Resolution (ConfigTowers priority + Sign 0.8x/0.9x support)
---   3. Persistent Upgrade Wait & Multi-Source Level Verification (GameReplicator + UI + Events)
---   4. UsedTowerIds Exclusion (prevents nearby Godlies from overwriting each other's ID)
---   5. Full TowerAbility (Relocate/Teleport) Recording & Replay Support
+-- CAMERA TD // MATCH & MACRO STUDIO MODULE (Match.lua)
+-- 100% Dynamic Game Config Loader (No Hardcoded Prices) + Arceus X / PC Safe
 -- ============================================================================
 
 if not game:IsLoaded() then
@@ -58,11 +53,10 @@ local function trackConn(conn)
 end
 
 -- ==================== 2. SERVICES & LOGGING ====================
-local Players          = game:GetService("Players")
-local RS               = game:GetService("ReplicatedStorage")
-local HttpService      = game:GetService("HttpService")
-local GroupService     = game:GetService("GroupService")
-local VirtualUser      = nil
+local Players     = game:GetService("Players")
+local RS          = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
+local VirtualUser = nil
 pcall(function() VirtualUser = game:GetService("VirtualUser") end)
 
 local LP = Players.LocalPlayer or Players.PlayerAdded:Wait()
@@ -117,9 +111,9 @@ local function addLog(text, isError)
         end
     end)
     if isError then
-        warn("[CameraTD Match] " .. tostring(text))
+        warn("[CameraTD] " .. tostring(text))
     else
-        print("[CameraTD Match] " .. tostring(text))
+        print("[CameraTD] " .. tostring(text))
     end
     if StatusLabels.Console then
         setLabel(StatusLabels.Console, table.concat(logEntries, "\n"))
@@ -191,7 +185,7 @@ pcall(function()
 end)
 
 local DEFAULTS = {
-    -- Lobby Settings (Preserved in shared JSON)
+    -- Lobby Settings
     autoJoinMatch       = false,
     selectedMap         = "Toilet City",
     joinMethod          = "Teleport",
@@ -279,7 +273,7 @@ safeCall("LoadObsidianLibrary", function()
 end)
 
 if not Library then
-    warn("[CameraTD Match] Critical: Could not load Obsidian Library.")
+    warn("[CameraTD] Critical: Could not load Obsidian Library.")
     return
 end
 
@@ -334,7 +328,7 @@ local function armAutoExecute(showLog)
             S.teleportQueued = true
             ENV.__CAM_TD_TP_ARMED = true
             if showLog then
-                addLog("✅ Auto-Execute Armed (Loader + Cache)!")
+                addLog("✅ Auto-Execute Armed (GitHub Live + Cache)!")
                 notify("Auto-Execute", "Armed for next teleport!", 3)
             end
             return true
@@ -391,11 +385,11 @@ task.spawn(function()
     while Controller.Running do
         destroyLegacyUI()
         applyFPSCap(S.fpsCap)
-        task.wait(2.5)
+        task.wait(2.0)
     end
 end)
 
--- ==================== 6. GUARANTEED TOWER CONFIG & ENGINE HELPERS ====================
+-- ==================== 6. DYNAMIC GAME CONFIG LOADER & ECONOMY HELPERS ====================
 local playerGui        = LP:FindFirstChildOfClass("PlayerGui")
 local gameUI           = playerGui and playerGui:FindFirstChild("GameUI")
 local gameFolder       = workspace:FindFirstChild("Game")
@@ -403,164 +397,55 @@ local towersFolder     = gameFolder and gameFolder:FindFirstChild("Towers")
 
 local ConfigModule     = nil
 local ConfigTowers     = {}
-local GameReplicator   = nil
-local ReplicationMod   = nil
 local Remotes          = {}
 local MatchEngineReady = false
-local SignRankCache    = { ["xxOk"] = 253, ["NeoBelow"] = 253 }
-local SignChecking     = {}
+local LiveTowersById   = {}
 
--- Guaranteed multi-source loader for all 50+ Tower Configs (Fixes $200 fallback bug!)
-local function loadAllTowerConfigs()
-    local count = 0
-
-    -- Source 1: shared.Modules.Config
+-- Dynamically loads Tower Configs from the game's ReplicatedStorage (Works on BOTH Potassium & Arceus X!)
+local function syncGameTowerConfigs()
+    -- 1. Try shared.Modules.Config (PC / Potassium)
     pcall(function()
         if shared and shared.Modules and type(shared.Modules.Config) == "table" then
             ConfigModule = shared.Modules.Config
             if type(ConfigModule.Towers) == "table" then
-                for k, v in pairs(ConfigModule.Towers) do
-                    ConfigTowers[k] = v
+                for name, data in pairs(ConfigModule.Towers) do
+                    ConfigTowers[name] = data
                 end
             end
         end
     end)
 
-    -- Source 2: require(ReplicatedStorage.ModuleLoader.Configs.Config)
-    pcall(function()
-        local ml = RS:FindFirstChild("ModuleLoader")
-        local cfgs = ml and ml:FindFirstChild("Configs")
-        local cfgScript = cfgs and cfgs:FindFirstChild("Config")
-        if cfgScript and cfgScript:IsA("ModuleScript") then
-            local ok, mod = pcall(require, cfgScript)
-            if ok and type(mod) == "table" then
-                ConfigModule = ConfigModule or mod
-                if type(mod.Towers) == "table" then
-                    for k, v in pairs(mod.Towers) do
-                        ConfigTowers[k] = v
+    -- 2. If ConfigTowers is still empty (Mobile / Arceus X where shared.Modules is isolated), require directly from ReplicatedStorage!
+    if next(ConfigTowers) == nil then
+        pcall(function()
+            local ml = RS:FindFirstChild("ModuleLoader")
+            local cfgs = ml and ml:FindFirstChild("Configs")
+            local cfgMod = cfgs and cfgs:FindFirstChild("Config")
+            if cfgMod and cfgMod:IsA("ModuleScript") then
+                local ok, mainCfg = pcall(require, cfgMod)
+                if ok and type(mainCfg) == "table" and type(mainCfg.Towers) == "table" then
+                    ConfigModule = mainCfg
+                    for name, data in pairs(mainCfg.Towers) do
+                        ConfigTowers[name] = data
                     end
                 end
             end
-        end
-    end)
-
-    -- Source 3: Direct require of each ModuleScript inside Config.Towers (100% Executor-Proof)
-    pcall(function()
-        local ml = RS:FindFirstChild("ModuleLoader")
-        local cfgs = ml and ml:FindFirstChild("Configs")
-        local cfgScript = cfgs and cfgs:FindFirstChild("Config")
-        local towersRoot = cfgScript and cfgScript:FindFirstChild("Towers")
-        if towersRoot then
-            for _, desc in ipairs(towersRoot:GetDescendants()) do
-                if desc:IsA("ModuleScript") and not ConfigTowers[desc.Name] then
-                    local ok, tData = pcall(require, desc)
-                    if ok and type(tData) == "table" and type(tData.Upgrades) == "table" then
-                        ConfigTowers[desc.Name] = tData
+            -- Also scan child ModuleScripts inside Config.Towers directly
+            local towersDir = cfgMod and cfgMod:FindFirstChild("Towers")
+            if towersDir then
+                for _, desc in ipairs(towersDir:GetDescendants()) do
+                    if desc:IsA("ModuleScript") and not ConfigTowers[desc.Name] then
+                        task.spawn(function()
+                            local ok, tData = pcall(require, desc)
+                            if ok and type(tData) == "table" and type(tData.Upgrades) == "table" then
+                                ConfigTowers[desc.Name] = tData
+                            end
+                        end)
                     end
                 end
             end
-        end
-    end)
-
-    for _ in pairs(ConfigTowers) do
-        count += 1
-    end
-    return count
-end
-
-local function getReplica()
-    local rep = nil
-    pcall(function()
-        if not ReplicationMod then
-            ReplicationMod = (shared and shared.Modules and shared.Modules.Replication)
-                or (RS:FindFirstChild("ModuleLoader") and RS.ModuleLoader:FindFirstChild("Client") and RS.ModuleLoader.Client:FindFirstChild("Replication") and require(RS.ModuleLoader.Client.Replication))
-        end
-        if ReplicationMod and type(ReplicationMod.GetCurrentReplica) == "function" then
-            rep = ReplicationMod.GetCurrentReplica()
-        end
-    end)
-    return rep
-end
-
-local function getGameReplicator()
-    pcall(function()
-        if not GameReplicator then
-            GameReplicator = (shared and shared.Modules and shared.Modules.GameReplicator)
-                or (RS:FindFirstChild("ModuleLoader") and RS.ModuleLoader:FindFirstChild("Client") and RS.ModuleLoader.Client:FindFirstChild("GameReplicator") and require(RS.ModuleLoader.Client.GameReplicator))
-        end
-    end)
-    return GameReplicator
-end
-
--- Exact Sign discount multiplier matching GameUI.luau (0.8x for rank > 230, 0.9x for rank > 0)
-local function resolveSignRankAsync(signName)
-    if type(signName) ~= "string" or signName == "" then return nil end
-    if SignRankCache[signName] ~= nil then return SignRankCache[signName] end
-    if not SignChecking[signName] then
-        SignChecking[signName] = true
-        task.spawn(function()
-            local uid = nil
-            pcall(function() uid = Players:GetUserIdFromNameAsync(signName) end)
-            local rank = 0
-            if uid then
-                pcall(function()
-                    local groups = GroupService:GetGroupsAsync(uid)
-                    for _, g in ipairs(groups) do
-                        if g.Id == game.CreatorId then
-                            rank = g.Rank or 0
-                            break
-                        end
-                    end
-                end)
-            end
-            SignRankCache[signName] = rank
         end)
     end
-    return SignRankCache[signName]
-end
-
-local function getUnitSignMultiplier(unitId, towerName)
-    -- 1. Check live hotbar slot price ratio vs base price if equipped in slot
-    if towerName and ConfigTowers[towerName] and ConfigTowers[towerName].Upgrades and ConfigTowers[towerName].Upgrades[1] then
-        local basePlacePrice = tonumber(ConfigTowers[towerName].Upgrades[1].Price)
-        if basePlacePrice and basePlacePrice > 0 then
-            for slot = 1, 5 do
-                local sName = LP:GetAttribute("Slot" .. slot)
-                local sId   = LP:GetAttribute("Slot" .. slot .. "Id")
-                if sName == towerName and (not unitId or sId == unitId) then
-                    if not gameUI then
-                        playerGui = LP:FindFirstChildOfClass("PlayerGui")
-                        gameUI = playerGui and playerGui:FindFirstChild("GameUI")
-                    end
-                    local slotGui = gameUI and gameUI:FindFirstChild("Slots") and gameUI.Slots:FindFirstChild("Slot" .. slot)
-                    local pLbl = slotGui and slotGui:FindFirstChild("TroopFrame") and slotGui.TroopFrame:FindFirstChild("Price")
-                    if pLbl and pLbl:IsA("TextLabel") and pLbl.Text ~= "" then
-                        local slotPrice = tonumber(pLbl.Text:gsub("[^%d]", ""))
-                        if slotPrice and slotPrice > 0 and slotPrice < basePlacePrice then
-                            local ratio = slotPrice / basePlacePrice
-                            if math.abs(ratio - 0.8) < 0.03 then return 0.8 end
-                            if math.abs(ratio - 0.9) < 0.03 then return 0.9 end
-                        end
-                    end
-                end
-            end
-        end
-    end
-
-    -- 2. Check Replica.Data.Towers[unitId].Sign
-    if type(unitId) == "string" and unitId ~= "" then
-        local rep = getReplica()
-        local tEntry = rep and rep.Data and rep.Data.Towers and rep.Data.Towers[unitId]
-        if tEntry and type(tEntry.Sign) == "string" and tEntry.Sign ~= "" then
-            local rank = resolveSignRankAsync(tEntry.Sign)
-            if rank then
-                if rank > 230 then return 0.8 end
-                if rank > 0 then return 0.9 end
-            end
-        end
-    end
-
-    return 1
 end
 
 local function isWaveSkipBlocked(wave, filterStr)
@@ -594,9 +479,11 @@ end
 
 local function applyVFXSetting(disable)
     pcall(function()
-        local rep = getReplica()
-        if rep and rep.Data and rep.Data.Settings then
-            rep.Data.Settings.VFX = not disable
+        if shared and shared.Modules and shared.Modules.Replication then
+            local rep = shared.Modules.Replication.GetCurrentReplica()
+            if rep and rep.Data and rep.Data.Settings then
+                rep.Data.Settings.VFX = not disable
+            end
         end
     end)
 end
@@ -676,31 +563,34 @@ local function getDistanceXZ(pos1, pos2)
     return math.sqrt((pos1.X - pos2.X)^2 + (pos1.Z - pos2.Z)^2)
 end
 
-local function resolveUnitIdForTower(towerName, fallbackId)
-    for slot = 1, 5 do
-        local sName = LP:GetAttribute("Slot" .. slot)
-        local sId = LP:GetAttribute("Slot" .. slot .. "Id")
-        if sName == towerName and type(sId) == "string" and sId ~= "" then
-            return sId
-        end
+-- Detects if the player's equipped unit in hotbar has a Sign discount (0.8x or 0.9x) by comparing Slot UI price vs Config price
+local function getSlotSignMultiplier(towerName)
+    local tData = ConfigTowers[towerName]
+    local basePlace = tData and tData.Upgrades and tData.Upgrades[1] and tonumber(tData.Upgrades[1].Price)
+    if not basePlace or basePlace <= 0 then return 1 end
+    if not gameUI then
+        playerGui = LP:FindFirstChildOfClass("PlayerGui")
+        gameUI = playerGui and playerGui:FindFirstChild("GameUI")
     end
-    local foundId = nil
-    pcall(function()
-        local rep = getReplica()
-        if rep and rep.Data and rep.Data.Towers then
-            for id, data in pairs(rep.Data.Towers) do
-                if data.Name == towerName and data.Equipped then
-                    foundId = tostring(id)
-                    break
+    for slot = 1, 5 do
+        if LP:GetAttribute("Slot" .. slot) == towerName then
+            local slotGui = gameUI and gameUI:FindFirstChild("Slots") and gameUI.Slots:FindFirstChild("Slot" .. slot)
+            local pLbl = slotGui and slotGui:FindFirstChild("TroopFrame") and slotGui.TroopFrame:FindFirstChild("Price")
+            if pLbl and pLbl:IsA("TextLabel") and pLbl.Text ~= "" then
+                local slotPrice = tonumber(pLbl.Text:gsub("[^%d]", ""))
+                if slotPrice and slotPrice > 0 and slotPrice < basePlace then
+                    local ratio = slotPrice / basePlace
+                    if math.abs(ratio - 0.8) < 0.03 then return 0.8 end
+                    if math.abs(ratio - 0.9) < 0.03 then return 0.9 end
                 end
             end
         end
-    end)
-    return foundId or fallbackId or "1"
+    end
+    return 1
 end
 
--- AUTHORITATIVE COST RESOLVERS (Prioritizes live Slot UI & ConfigTowers over stale/fallback recordedCost!)
-local function getTowerPlacementCost(towerName, recordedCost, unitId)
+-- Dynamic Placement Cost from Live Slot UI or Game's ConfigTowers
+local function getTowerPlacementCost(towerName, recordedCost)
     if not gameUI then
         playerGui = LP:FindFirstChildOfClass("PlayerGui")
         gameUI = playerGui and playerGui:FindFirstChild("GameUI")
@@ -718,8 +608,7 @@ local function getTowerPlacementCost(towerName, recordedCost, unitId)
     local tData = ConfigTowers[towerName]
     if tData and tData.Upgrades and tData.Upgrades[1] and tData.Upgrades[1].Price then
         local basePrice = tonumber(tData.Upgrades[1].Price) or 100
-        local mult = getUnitSignMultiplier(unitId or resolveUnitIdForTower(towerName), towerName)
-        return math.floor(basePrice * mult)
+        return math.floor(basePrice * getSlotSignMultiplier(towerName))
     end
     if recordedCost and tonumber(recordedCost) and tonumber(recordedCost) > 0 then
         return tonumber(recordedCost)
@@ -727,16 +616,15 @@ local function getTowerPlacementCost(towerName, recordedCost, unitId)
     return 100
 end
 
-local function getTowerUpgradeCost(towerName, nextLevel, recordedCost, unitId)
+-- Dynamic Upgrade Cost from Game's ConfigTowers (Prioritizes live game config over old $200 fallback!)
+local function getTowerUpgradeCost(towerName, nextLevel, recordedCost)
     local tData = ConfigTowers[towerName]
     if tData and tData.Upgrades and tData.Upgrades[nextLevel] and tData.Upgrades[nextLevel].Price then
         local basePrice = tonumber(tData.Upgrades[nextLevel].Price)
         if basePrice and basePrice > 0 then
-            local mult = getUnitSignMultiplier(unitId or resolveUnitIdForTower(towerName), towerName)
-            return math.floor(basePrice * mult)
+            return math.floor(basePrice * getSlotSignMultiplier(towerName))
         end
     end
-    -- Only trust recordedCost if ConfigTowers didn't have the tower (and ignore old $200 fallback bugs on high levels)
     if recordedCost and tonumber(recordedCost) and tonumber(recordedCost) > 0 then
         local rc = tonumber(recordedCost)
         if not (rc == 200 and (tonumber(nextLevel) or 2) >= 4) then
@@ -754,16 +642,34 @@ local function getTowerMaxLevel(towerName)
     return 99
 end
 
-local function getTowerAbilityCost(towerName, recordedCost)
-    local tData = ConfigTowers[towerName]
-    if tData and tData.Ability and tonumber(tData.Ability.Price) then
-        return tonumber(tData.Ability.Price)
+-- Safe UnitId resolver (Never calls blocking require(Replication) on Arceus X!)
+local function resolveUnitIdForTower(towerName, fallbackId)
+    for slot = 1, 5 do
+        local sName = LP:GetAttribute("Slot" .. slot)
+        local sId   = LP:GetAttribute("Slot" .. slot .. "Id")
+        if sName == towerName and type(sId) == "string" and sId ~= "" then
+            return sId
+        end
     end
-    return tonumber(recordedCost) or 0
+    local foundId = nil
+    pcall(function()
+        if shared and shared.Modules and shared.Modules.Replication and type(shared.Modules.Replication.GetCurrentReplica) == "function" then
+            local rep = shared.Modules.Replication.GetCurrentReplica()
+            if rep and rep.Data and rep.Data.Towers then
+                for id, data in pairs(rep.Data.Towers) do
+                    if data.Name == towerName and data.Equipped then
+                        foundId = tostring(id)
+                        break
+                    end
+                end
+            end
+        end
+    end)
+    return foundId or fallbackId or "1"
 end
 
--- ==================== 7. MACRO RECORDING & REPLAY ENGINE (v6.0) ====================
-local recData                 = { version = 6.0, actions = {} }
+-- ==================== 7. MACRO RECORDING & REPLAY ENGINE ====================
+local recData                 = { version = 5.4, actions = {} }
 local TowerIdToPlacementIndex = {}
 local recordedTowerLevels     = {}
 local recordedSoldTowers      = {}
@@ -772,24 +678,26 @@ local pendingUnitIds          = {}
 local lastPlaceTime           = 0
 local lastPlacePos            = Vector3.zero
 
-local ReplayTowers            = {} -- [placementIndex] = tId
-local UsedTowerIds            = {} -- [tId] = placementIndex (Prevents nearby Godlies from colliding!)
-local ActiveTowerLevels       = {} -- [tId] = currentLevel
+local ReplayTowers            = {}
+local UsedTowerIds            = {}
+local ActiveTowerLevels       = {}
 local ActiveTowerModes        = {}
 local PendingReplayPlace      = nil
 
--- Multi-source live tower level reader (Events + GameReplicator.Data.Towers + Billboard UI)
 local function getLiveTowerLevel(tId)
     if not tId then return 1 end
     tId = tostring(tId)
     local bestLvl = ActiveTowerLevels[tId] or 1
 
-    -- Check GameReplicator.Data.Towers
+    local ld = LiveTowersById[tId]
+    if ld and tonumber(ld.Level) and tonumber(ld.Level) > bestLvl then
+        bestLvl = tonumber(ld.Level)
+        ActiveTowerLevels[tId] = bestLvl
+    end
+
     pcall(function()
-        local gr = getGameReplicator()
-        local towers = gr and gr.Data and gr.Data.Towers
-        if towers then
-            local entry = towers[tId] or towers[tonumber(tId)]
+        if shared and shared.Modules and shared.Modules.GameReplicator and shared.Modules.GameReplicator.Data and shared.Modules.GameReplicator.Data.Towers then
+            local entry = shared.Modules.GameReplicator.Data.Towers[tId] or shared.Modules.GameReplicator.Data.Towers[tonumber(tId)]
             if entry and tonumber(entry.Level) and tonumber(entry.Level) > bestLvl then
                 bestLvl = tonumber(entry.Level)
                 ActiveTowerLevels[tId] = bestLvl
@@ -797,7 +705,6 @@ local function getLiveTowerLevel(tId)
         end
     end)
 
-    -- Check Model TroopStatus BillboardGui ("💪 Level X 💪")
     pcall(function()
         if not towersFolder then
             gameFolder = workspace:FindFirstChild("Game")
@@ -816,20 +723,6 @@ local function getLiveTowerLevel(tId)
     end)
 
     return bestLvl
-end
-
-local function getLiveTowerData(tId)
-    if not tId then return nil end
-    tId = tostring(tId)
-    local found = nil
-    pcall(function()
-        local gr = getGameReplicator()
-        local towers = gr and gr.Data and gr.Data.Towers
-        if towers then
-            found = towers[tId] or towers[tonumber(tId)]
-        end
-    end)
-    return found
 end
 
 local function updateMacroTimelineUI()
@@ -858,15 +751,13 @@ local function updateMacroTimelineUI()
                 local prefix = (S.replaying and S.currentStepIndex == i) and "▶ " or "  "
                 local desc = ""
                 if a.type == "place" then
-                    desc = string.format("[%d] PLACE #%d: %s ($%d)", i, a.placementIndex or i, tostring(a.towerName), getTowerPlacementCost(a.towerName, a.cost, a.unitId))
+                    desc = string.format("[%d] PLACE #%d: %s ($%d)", i, a.placementIndex or i, tostring(a.towerName), getTowerPlacementCost(a.towerName, a.cost))
                 elseif a.type == "upgrade" then
                     desc = string.format("[%d] UPG #%d (%s) -> Lvl %d ($%d)", i, a.placementIndex or 0, tostring(a.towerName or "Unit"), a.targetLevel or 2, getTowerUpgradeCost(a.towerName or "", a.targetLevel or 2, a.cost))
                 elseif a.type == "sell" then
                     desc = string.format("[%d] SELL Unit #%d", i, a.placementIndex or 0)
                 elseif a.type == "target" then
                     desc = string.format("[%d] TARGET #%d -> %s", i, a.placementIndex or 0, tostring(a.targetMode))
-                elseif a.type == "ability" then
-                    desc = string.format("[%d] ABILITY #%d (%s)", i, a.placementIndex or 0, tostring(a.towerName or "Unit"))
                 end
                 table.insert(lines, prefix .. desc)
             end
@@ -883,24 +774,21 @@ local function syncMacroFromRec(name)
     updateMacroTimelineUI()
 end
 
--- Repairs any older macro actions where towerName or cost was missing/corrupted
 local function repairMacroActions(actions)
     if type(actions) ~= "table" then return end
     local idxToTower = {}
-    local idxToUnitId = {}
     for _, act in ipairs(actions) do
         if act.type == "place" and act.placementIndex and act.towerName then
             idxToTower[act.placementIndex] = act.towerName
-            idxToUnitId[act.placementIndex] = act.unitId
             if ConfigTowers[act.towerName] then
-                act.cost = getTowerPlacementCost(act.towerName, act.cost, act.unitId)
+                act.cost = getTowerPlacementCost(act.towerName, act.cost)
             end
         elseif act.type == "upgrade" and act.placementIndex then
             if (not act.towerName or act.towerName == "" or act.towerName == "Unknown") and idxToTower[act.placementIndex] then
                 act.towerName = idxToTower[act.placementIndex]
             end
             if act.towerName and ConfigTowers[act.towerName] then
-                act.cost = getTowerUpgradeCost(act.towerName, act.targetLevel or 2, act.cost, idxToUnitId[act.placementIndex])
+                act.cost = getTowerUpgradeCost(act.towerName, act.targetLevel or 2, act.cost)
             end
         end
     end
@@ -953,10 +841,9 @@ local function loadMacroByName(name)
     return false
 end
 
--- Outgoing Remote Hook for Recording UnitId & TowerAbility
-ENV.__CAM_TD_HOOK_CB = function(remoteName, payload)
-    if not S.recording or type(payload) ~= "table" then return end
-    if remoteName == "TowerAdd" and payload.Name then
+ENV.__CAM_TD_HOOK_CB = function(payload)
+    if not S.recording then return end
+    if type(payload) == "table" and payload.Name then
         pendingUnitIds[tostring(payload.Name)] = payload.UnitId and tostring(payload.UnitId) or resolveUnitIdForTower(tostring(payload.Name))
         local now = tick()
         local pos = payload.Pos or (payload.CFrame and payload.CFrame.Position)
@@ -964,39 +851,6 @@ ENV.__CAM_TD_HOOK_CB = function(remoteName, payload)
             if (now - lastPlaceTime < 0.35) and (getDistanceXZ(lastPlacePos, pos) < 1.0) then return end
             lastPlaceTime = now
             lastPlacePos = pos
-        end
-    elseif remoteName == "TowerAbility" and payload.Id then
-        local tId = tostring(payload.Id)
-        local pIdx = TowerIdToPlacementIndex[tId]
-        if pIdx then
-            local towerName = "Unknown"
-            for _, act in ipairs(recData.actions) do
-                if act.type == "place" and act.placementIndex == pIdx then
-                    towerName = act.towerName
-                    break
-                end
-            end
-            local targetPos, targetCf = nil, nil
-            if type(payload.Args) == "table" then
-                if typeof(payload.Args.TargetPosition) == "Vector3" then
-                    local tp = payload.Args.TargetPosition
-                    targetPos = { tp.X, tp.Y, tp.Z }
-                end
-                if typeof(payload.Args.TargetCFrame) == "CFrame" then
-                    targetCf = { payload.Args.TargetCFrame:GetComponents() }
-                end
-            end
-            local abCost = getTowerAbilityCost(towerName)
-            table.insert(recData.actions, {
-                type           = "ability",
-                placementIndex = pIdx,
-                towerName      = towerName,
-                cost           = abCost,
-                targetPos      = targetPos,
-                targetCFrame   = targetCf
-            })
-            updateMacroTimelineUI()
-            addLog(string.format("[REC] Ability #%d (%s)", pIdx, towerName))
         end
     end
 end
@@ -1010,10 +864,9 @@ if not ENV.__CAM_TD_NAMECALL_HOOKED and hookmetamethod and getnamecallmethod the
         oldNamecall = hookmetamethod(game, "__namecall", wrapClosure(function(self, ...)
             local method = getnamecallmethod()
             if not isCaller() and typeof(self) == "Instance" and (method == "FireServer" or method == "fireServer") then
-                if (self.Name == "TowerAdd" or self.Name == "TowerAbility") and ENV.__CAM_TD_HOOK_CB then
-                    local rName = self.Name
+                if self.Name == "TowerAdd" and ENV.__CAM_TD_HOOK_CB then
                     local args = { ... }
-                    task.spawn(function() pcall(ENV.__CAM_TD_HOOK_CB, rName, args[1]) end)
+                    task.spawn(function() pcall(ENV.__CAM_TD_HOOK_CB, args[1]) end)
                 end
             end
             return oldNamecall(self, ...)
@@ -1021,48 +874,32 @@ if not ENV.__CAM_TD_NAMECALL_HOOKED and hookmetamethod and getnamecallmethod the
     end)
 end
 
-local function resolvePlacementIndexForRecording(tId)
-    if TowerIdToPlacementIndex[tId] then
-        return TowerIdToPlacementIndex[tId]
-    end
-    -- If user started recording after placing a tower, auto-register the existing tower so upgrades aren't lost!
-    local liveData = getLiveTowerData(tId)
-    if liveData and ((liveData.OwnerUserId == LP.UserId) or (liveData.OwnerName == LP.Name)) and liveData.Pos then
-        local tName = tostring(liveData.Name or "Tower")
-        local pos = liveData.Pos
-        local rawCf = liveData.CFrame or CFrame.new(pos)
-        local _, yawRad, _ = rawCf:ToOrientation()
-        local cf = CFrame.new(pos) * CFrame.Angles(0, yawRad, 0)
-        local newIdx = #recData.actions + 1
-        local savedUnitId = liveData.UnitId or resolveUnitIdForTower(tName, "1")
-        local liveCost = getTowerPlacementCost(tName, nil, savedUnitId)
-        TowerIdToPlacementIndex[tId] = newIdx
-        recordedTowerLevels[tId] = tonumber(liveData.Level) or 1
-        table.insert(recData.actions, {
-            type           = "place",
-            placementIndex = newIdx,
-            towerName      = tName,
-            unitId         = savedUnitId,
-            cost           = liveCost,
-            pos            = { pos.X, pos.Y, pos.Z },
-            cframe         = { cf:GetComponents() }
-        })
-        addLog(string.format("[REC Auto-Registered #%d] %s", newIdx, tName))
-        return newIdx
-    end
-    return nil
-end
-
 local function bindMatchRemoteListeners()
+    if Remotes.Replication then
+        trackConn(Remotes.Replication.OnClientEvent:Connect(function(state)
+            if type(state) == "table" and type(state.Towers) == "table" then
+                for k, v in pairs(state.Towers) do
+                    local id = tostring((type(v) == "table" and (v.Id or v.Index)) or k)
+                    LiveTowersById[id] = v
+                    if type(v) == "table" and tonumber(v.Level) then
+                        ActiveTowerLevels[id] = tonumber(v.Level)
+                    end
+                end
+            end
+        end))
+    end
+
     if Remotes.TowerAdd then
         trackConn(Remotes.TowerAdd.OnClientEvent:Connect(function(data)
             safeCall("TowerAddListener", function()
                 local rawId = data and (data.Id or data.Index)
                 if not rawId then return end
+                local tId = tostring(rawId)
+                LiveTowersById[tId] = data
+
                 local isMine = (data.OwnerUserId == LP.UserId) or (data.OwnerName == LP.Name)
                 if not isMine or not data.Pos then return end
 
-                local tId   = tostring(rawId)
                 local tName = tostring(data.Name or "Tower")
                 local pos   = data.Pos
                 local rawCf = data.CFrame or CFrame.new(pos)
@@ -1071,10 +908,10 @@ local function bindMatchRemoteListeners()
 
                 if S.recording and not TowerIdToPlacementIndex[tId] then
                     local newIdx      = #recData.actions + 1
-                    local savedUnitId = pendingUnitIds[tName] or data.UnitId or resolveUnitIdForTower(tName, "1")
-                    local liveCost    = getTowerPlacementCost(tName, data.Stats and tonumber(data.Stats.Price), savedUnitId)
+                    local savedUnitId = pendingUnitIds[tName] or resolveUnitIdForTower(tName, "1")
+                    local liveCost    = (data.Stats and tonumber(data.Stats.Price)) or getTowerPlacementCost(tName)
                     TowerIdToPlacementIndex[tId] = newIdx
-                    recordedTowerLevels[tId]     = tonumber(data.Level) or 1
+                    recordedTowerLevels[tId]     = 1
                     table.insert(recData.actions, {
                         type           = "place",
                         placementIndex = newIdx,
@@ -1090,7 +927,6 @@ local function bindMatchRemoteListeners()
 
                 if S.replaying then
                     ActiveTowerLevels[tId] = tonumber(data.Level) or 1
-                    -- 1. Check active PendingReplayPlace first (100% accurate for multiple nearby Godlies!)
                     if PendingReplayPlace and not UsedTowerIds[tId] then
                         if PendingReplayPlace.towerName == tName and getDistanceXZ(PendingReplayPlace.pos, pos) < 3.5 then
                             local pIdx = PendingReplayPlace.placementIndex
@@ -1099,17 +935,14 @@ local function bindMatchRemoteListeners()
                             return
                         end
                     end
-                    -- 2. Fallback: bind to the first UNBOUND placementIndex matching towerName & position
                     if S.macro and S.macro.actions and not UsedTowerIds[tId] then
                         for _, act in ipairs(S.macro.actions) do
                             if act.type == "place" and act.pos and not ReplayTowers[act.placementIndex] then
-                                if (not act.towerName or act.towerName == tName) then
-                                    local actPos = Vector3.new(act.pos[1], act.pos[2], act.pos[3])
-                                    if getDistanceXZ(actPos, pos) < 3.0 then
-                                        ReplayTowers[act.placementIndex] = tId
-                                        UsedTowerIds[tId] = act.placementIndex
-                                        break
-                                    end
+                                local actPos = Vector3.new(act.pos[1], act.pos[2], act.pos[3])
+                                if getDistanceXZ(actPos, pos) < 2.8 then
+                                    ReplayTowers[act.placementIndex] = tId
+                                    UsedTowerIds[tId] = act.placementIndex
+                                    break
                                 end
                             end
                         end
@@ -1128,25 +961,26 @@ local function bindMatchRemoteListeners()
                 local lvl = tonumber(data.Level)
                 if lvl then
                     ActiveTowerLevels[tId] = lvl
+                    if LiveTowersById[tId] then
+                        LiveTowersById[tId].Level = lvl
+                    end
                 end
 
                 if S.recording then
-                    local pIdx = resolvePlacementIndexForRecording(tId)
+                    local pIdx = TowerIdToPlacementIndex[tId]
                     if not pIdx then return end
-                    local newLvl  = lvl or getLiveTowerLevel(tId) or ((recordedTowerLevels[tId] or 1) + 1)
+                    local newLvl  = lvl or ((recordedTowerLevels[tId] or 1) + 1)
                     local lastLvl = recordedTowerLevels[tId] or 1
                     if newLvl > lastLvl then
-                        local towerName, unitId = "Unknown", nil
+                        local towerName = "Unknown"
                         for _, act in ipairs(recData.actions) do
                             if act.type == "place" and act.placementIndex == pIdx then
                                 towerName = act.towerName
-                                unitId    = act.unitId
                                 break
                             end
                         end
-                        -- Record every level increment (in case fast upgrades jumped multiple levels)
                         for stepLvl = lastLvl + 1, newLvl do
-                            local upgCost = getTowerUpgradeCost(towerName, stepLvl, nil, unitId)
+                            local upgCost = getTowerUpgradeCost(towerName, stepLvl)
                             table.insert(recData.actions, {
                                 type           = "upgrade",
                                 placementIndex = pIdx,
@@ -1172,6 +1006,7 @@ local function bindMatchRemoteListeners()
                 local rawId = data and (data.Id or data.Index)
                 if not rawId then return end
                 local tId = tostring(rawId)
+                LiveTowersById[tId] = nil
                 if S.recording then
                     local pIdx = TowerIdToPlacementIndex[tId]
                     if pIdx and not recordedSoldTowers[tId] then
@@ -1194,7 +1029,7 @@ local function bindMatchRemoteListeners()
                 local newMode = tostring(data.TargetMode)
                 ActiveTowerModes[tId] = newMode
                 if S.recording then
-                    local pIdx = resolvePlacementIndexForRecording(tId)
+                    local pIdx = TowerIdToPlacementIndex[tId]
                     if pIdx and (recordedTowerModes[tId] ~= newMode) then
                         recordedTowerModes[tId] = newMode
                         table.insert(recData.actions, {
@@ -1212,8 +1047,7 @@ local function bindMatchRemoteListeners()
     end
 end
 
--- Finds a placed tower model by position, optionally excluding towers already bound to other placementIndices!
-local function findPlacedTowerModelByPos(targetPos, maxDist, excludeUsed, expectedTowerName)
+local function findPlacedTowerModelByPos(targetPos, maxDist, excludeUsed)
     if not towersFolder then
         gameFolder = workspace:FindFirstChild("Game")
         towersFolder = gameFolder and gameFolder:FindFirstChild("Towers")
@@ -1223,19 +1057,11 @@ local function findPlacedTowerModelByPos(targetPos, maxDist, excludeUsed, expect
     local closestModel, closestDist = nil, 999999
     for _, child in ipairs(towersFolder:GetChildren()) do
         if child:IsA("Model") and not child.Name:match("^CinemamanHeadModules_") then
-            local tId = child.Name
-            if not (excludeUsed and UsedTowerIds[tId]) then
-                local liveData = getLiveTowerData(tId)
-                local nameOk = true
-                if expectedTowerName and liveData and liveData.Name and liveData.Name ~= expectedTowerName then
-                    nameOk = false
-                end
-                if nameOk then
-                    local dist = getDistanceXZ(child:GetPivot().Position, targetPos)
-                    if dist < closestDist then
-                        closestDist = dist
-                        closestModel = child
-                    end
+            if not (excludeUsed and UsedTowerIds[child.Name]) then
+                local dist = getDistanceXZ(child:GetPivot().Position, targetPos)
+                if dist < closestDist then
+                    closestDist = dist
+                    closestModel = child
                 end
             end
         end
@@ -1261,7 +1087,7 @@ local function awaitCashAndPause(cost, actionDesc)
         if cost <= 0 or getCash() >= cost then
             return "OK"
         end
-        setMatchStatusText(string.format("⏳ Need $%d / $%d (%s)", getCash(), cost, actionDesc))
+        setMatchStatusText(string.format("⏳ Need $%d/$%d (%s)", getCash(), cost, actionDesc))
         task.wait(0.15)
     end
     return "ABORT"
@@ -1274,7 +1100,7 @@ local function executeReplay(macroData)
         return
     end
 
-    loadAllTowerConfigs()
+    syncGameTowerConfigs()
     repairMacroActions(macroData.actions)
 
     if not isMatchActive() then
@@ -1311,13 +1137,11 @@ local function executeReplay(macroData)
         if a.type == "place" then
             stepSummary = string.format("Place %s (#%d)", tostring(a.towerName), a.placementIndex or i)
         elseif a.type == "upgrade" then
-            stepSummary = string.format("Upg #%d (%s) -> Lvl %d", a.placementIndex or 0, tostring(a.towerName or "Unit"), a.targetLevel or 2)
+            stepSummary = string.format("Upg #%d -> Lvl %d", a.placementIndex or 0, a.targetLevel or 2)
         elseif a.type == "sell" then
             stepSummary = string.format("Sell Unit #%d", a.placementIndex or 0)
         elseif a.type == "target" then
             stepSummary = string.format("Target #%d -> %s", a.placementIndex or 0, tostring(a.targetMode))
-        elseif a.type == "ability" then
-            stepSummary = string.format("Ability #%d (%s)", a.placementIndex or 0, tostring(a.towerName or "Unit"))
         end
         S.currentStepText = stepSummary
         updateMacroTimelineUI()
@@ -1336,8 +1160,7 @@ local function executeReplay(macroData)
                 end
                 local cf = CFrame.new(targetPos) * CFrame.Angles(0, yawRad, 0)
 
-                -- Only match an UNBOUND existing tower of the same type at this exact spot
-                local existing = findPlacedTowerModelByPos(targetPos, 1.6, true, a.towerName)
+                local existing = findPlacedTowerModelByPos(targetPos, 1.6, true)
                 if existing then
                     ReplayTowers[a.placementIndex]   = existing.Name
                     UsedTowerIds[existing.Name]      = a.placementIndex
@@ -1345,12 +1168,12 @@ local function executeReplay(macroData)
                     return
                 end
 
-                local unitId = resolveUnitIdForTower(a.towerName, a.unitId)
-                local cost   = getTowerPlacementCost(a.towerName, a.cost, unitId)
+                local cost   = getTowerPlacementCost(a.towerName, a.cost)
                 local status = awaitCashAndPause(cost, "Place " .. tostring(a.towerName))
                 if status == "ABORT" then S.replaying = false return end
                 if status == "SKIP" then return end
 
+                local unitId = resolveUnitIdForTower(a.towerName, a.unitId)
                 PendingReplayPlace = {
                     placementIndex = a.placementIndex,
                     towerName      = a.towerName,
@@ -1358,32 +1181,22 @@ local function executeReplay(macroData)
                 }
 
                 local placed, attempts = false, 0
-                while not placed and attempts < 14 and S.replaying and isMatchActive() and Controller.Running do
+                while not placed and attempts < 12 and S.replaying and isMatchActive() and Controller.Running do
                     if S.skipCurrentStep then S.skipCurrentStep = false break end
 
-                    -- Re-verify cash before each placement attempt
                     local wStat = awaitCashAndPause(cost, "Place " .. tostring(a.towerName))
                     if wStat == "ABORT" then S.replaying = false break end
                     if wStat == "SKIP" then break end
 
                     if Remotes.TowerAdd then
                         pcall(function()
-                            Remotes.TowerAdd:FireServer({
-                                Name   = a.towerName,
-                                UnitId = unitId,
-                                Pos    = targetPos,
-                                CFrame = cf
-                            })
+                            Remotes.TowerAdd:FireServer({ Name = a.towerName, UnitId = unitId, Pos = targetPos, CFrame = cf })
                         end)
                     end
-
                     local startWait = tick()
-                    while tick() - startWait < 1.3 and S.replaying and isMatchActive() do
-                        if ReplayTowers[a.placementIndex] then
-                            placed = true
-                            break
-                        end
-                        local found = findPlacedTowerModelByPos(targetPos, 2.5, true, a.towerName)
+                    while tick() - startWait < 1.4 and S.replaying and isMatchActive() do
+                        if ReplayTowers[a.placementIndex] then placed = true break end
+                        local found = findPlacedTowerModelByPos(targetPos, 2.5, true)
                         if found then
                             ReplayTowers[a.placementIndex] = found.Name
                             UsedTowerIds[found.Name]       = a.placementIndex
@@ -1395,10 +1208,9 @@ local function executeReplay(macroData)
                     end
                     attempts += 1
                 end
-
                 PendingReplayPlace = nil
                 if placed then
-                    addLog(string.format("Placed: %s (#%d -> ID %s)", tostring(a.towerName), a.placementIndex, tostring(ReplayTowers[a.placementIndex])))
+                    addLog(string.format("Placed: %s (#%d)", tostring(a.towerName), a.placementIndex))
                 else
                     addLog(string.format("Place Failed: %s (#%d)", tostring(a.towerName), a.placementIndex), true)
                 end
@@ -1411,12 +1223,10 @@ local function executeReplay(macroData)
                     towersFolder = gameFolder and gameFolder:FindFirstChild("Towers")
                 end
                 local model = tId and towersFolder and towersFolder:FindFirstChild(tId)
-
-                -- Fallback lookup if ReplayTowers wasn't mapped yet
                 if not model then
                     for _, prevAct in ipairs(macroData.actions) do
                         if prevAct.type == "place" and prevAct.placementIndex == a.placementIndex and prevAct.pos then
-                            model = findPlacedTowerModelByPos(Vector3.new(prevAct.pos[1], prevAct.pos[2], prevAct.pos[3]), 2.8, false, prevAct.towerName)
+                            model = findPlacedTowerModelByPos(Vector3.new(prevAct.pos[1], prevAct.pos[2], prevAct.pos[3]), 2.8, false)
                             if model then
                                 tId = model.Name
                                 ReplayTowers[a.placementIndex] = tId
@@ -1428,67 +1238,38 @@ local function executeReplay(macroData)
                 end
 
                 if model and tId and Remotes.TowerUpgrade then
-                    local towerName, unitId = a.towerName, nil
-                    for _, prevAct in ipairs(macroData.actions) do
-                        if prevAct.type == "place" and prevAct.placementIndex == a.placementIndex then
-                            if not towerName or towerName == "" or towerName == "Unknown" then
+                    local towerName = a.towerName
+                    if not towerName or towerName == "" or towerName == "Unknown" then
+                        for _, prevAct in ipairs(macroData.actions) do
+                            if prevAct.type == "place" and prevAct.placementIndex == a.placementIndex then
                                 towerName = prevAct.towerName
+                                break
                             end
-                            unitId = prevAct.unitId
-                            break
                         end
                     end
-                    if (not towerName or towerName == "" or towerName == "Unknown") then
-                        local liveData = getLiveTowerData(tId)
-                        if liveData and liveData.Name then
-                            towerName = liveData.Name
-                        end
-                    end
-                    towerName = towerName or "Upgraded Titan Cameraman"
-
+                    towerName = towerName or "Scientist Cameraman"
                     local maxLvl     = getTowerMaxLevel(towerName)
                     local currentLvl = getLiveTowerLevel(tId)
                     local targetLvl  = math.min(a.targetLevel or (currentLvl + 1), maxLvl)
-                    if currentLvl >= targetLvl then
-                        return
-                    end
+                    if currentLvl >= targetLvl then return end
 
-                    -- Authoritative upgrade cost from ConfigTowers (e.g. $27,000 for UTCM Level 6!)
-                    local cost = getTowerUpgradeCost(towerName, targetLvl, a.cost, unitId)
+                    local cost = getTowerUpgradeCost(towerName, targetLvl, a.cost)
 
-                    -- Persistent loop: NEVER gives up after 6 attempts while the tower exists and needs this upgrade!
+                    -- Persistent upgrade loop: Waits for required cash & confirms upgrade without premature 6-attempt skip!
                     local upgraded = false
                     while not upgraded and S.replaying and isMatchActive() and Controller.Running do
-                        if S.skipCurrentStep then
-                            S.skipCurrentStep = false
-                            break
-                        end
+                        if S.skipCurrentStep then S.skipCurrentStep = false break end
+                        if not (towersFolder and towersFolder:FindFirstChild(tId)) then break end
+                        if getLiveTowerLevel(tId) >= targetLvl then upgraded = true break end
 
-                        -- Verify tower still exists in workspace.Game.Towers (wasn't sold)
-                        if not (towersFolder and towersFolder:FindFirstChild(tId)) then
-                            addLog(string.format("Tower #%d (%s) no longer exists; skipping upgrade.", a.placementIndex, towerName), true)
-                            break
-                        end
-
-                        -- Check if level already reached targetLvl
-                        if getLiveTowerLevel(tId) >= targetLvl then
-                            upgraded = true
-                            break
-                        end
-
-                        -- Wait until player has enough cash (e.g. $27,000 for UTCM Lvl 6)
-                        local status = awaitCashAndPause(cost, string.format("Upg #%d (%s) -> Lvl %d", a.placementIndex, towerName, targetLvl))
+                        local status = awaitCashAndPause(cost, string.format("Upg #%d -> Lvl %d", a.placementIndex, targetLvl))
                         if status == "ABORT" then S.replaying = false return end
                         if status == "SKIP" then return end
 
-                        -- Fire upgrade remote
-                        pcall(function()
-                            Remotes.TowerUpgrade:FireServer({ Id = tId })
-                        end)
+                        pcall(function() Remotes.TowerUpgrade:FireServer({ Id = tId }) end)
 
-                        -- Wait up to 1.2s for server confirmation via Event / GameReplicator / Billboard
                         local waitStart = tick()
-                        while tick() - waitStart < 1.2 and S.replaying and isMatchActive() do
+                        while tick() - waitStart < 1.4 and S.replaying and isMatchActive() do
                             if getLiveTowerLevel(tId) >= targetLvl then
                                 upgraded = true
                                 break
@@ -1496,10 +1277,9 @@ local function executeReplay(macroData)
                             task.wait(0.05)
                         end
 
-                        -- If cash dropped significantly below cost, server processed it; give brief grace check
                         if not upgraded and getCash() < (cost * 0.5) then
                             local graceStart = tick()
-                            while tick() - graceStart < 1.5 and S.replaying and isMatchActive() do
+                            while tick() - graceStart < 1.8 and S.replaying and isMatchActive() do
                                 if getLiveTowerLevel(tId) >= targetLvl then
                                     upgraded = true
                                     break
@@ -1515,7 +1295,7 @@ local function executeReplay(macroData)
 
                     if upgraded then
                         ActiveTowerLevels[tId] = targetLvl
-                        addLog(string.format("Upgraded: #%d (%s) -> Lvl %d ($%d)", a.placementIndex, towerName, targetLvl, cost))
+                        addLog(string.format("Upgraded: #%d (%s) -> Lvl %d", a.placementIndex, towerName, targetLvl))
                     end
                 end
                 task.wait(0.1)
@@ -1541,54 +1321,11 @@ local function executeReplay(macroData)
                 if status ~= "SKIP" then
                     local tId = ReplayTowers[a.placementIndex]
                     if tId and Remotes.TowerTarget then
-                        -- Cycle target mode until it matches a.targetMode (or fire once if no mode specified)
-                        local desired = a.targetMode
-                        for cycle = 1, 5 do
-                            local liveData = getLiveTowerData(tId)
-                            local curMode = ActiveTowerModes[tId] or (liveData and liveData.TargetMode) or "First"
-                            if desired and curMode == desired and cycle > 1 then
-                                break
-                            end
-                            pcall(function() Remotes.TowerTarget:FireServer({ Id = tId }) end)
-                            if not desired then break end
-                            local wStart = tick()
-                            while tick() - wStart < 0.45 do
-                                local ld = getLiveTowerData(tId)
-                                local cm = ActiveTowerModes[tId] or (ld and ld.TargetMode)
-                                if cm == desired then break end
-                                task.wait(0.05)
-                            end
-                            local ld2 = getLiveTowerData(tId)
-                            if (ActiveTowerModes[tId] or (ld2 and ld2.TargetMode)) == desired then
-                                break
-                            end
-                        end
+                        pcall(function() Remotes.TowerTarget:FireServer({ Id = tId }) end)
                         addLog(string.format("Target Mode #%d -> %s", a.placementIndex, tostring(a.targetMode)))
                     end
                 end
                 task.wait(0.1)
-
-            elseif a.type == "ability" then
-                local tId = ReplayTowers[a.placementIndex]
-                local abCost = getTowerAbilityCost(a.towerName, a.cost)
-                local status = awaitCashAndPause(abCost, "Ability #" .. tostring(a.placementIndex))
-                if status == "ABORT" then S.replaying = false return end
-                if status ~= "SKIP" and tId and Remotes.TowerAbility then
-                    local argsTbl = nil
-                    if a.targetPos and #a.targetPos == 3 then
-                        local tp = Vector3.new(a.targetPos[1], a.targetPos[2], a.targetPos[3])
-                        local tcf = CFrame.new(tp)
-                        if a.targetCFrame and #a.targetCFrame == 12 then
-                            pcall(function() tcf = CFrame.new(table.unpack(a.targetCFrame)) end)
-                        end
-                        argsTbl = { TargetPosition = tp, TargetCFrame = tcf }
-                    end
-                    pcall(function()
-                        Remotes.TowerAbility:FireServer({ Id = tId, Args = argsTbl })
-                    end)
-                    addLog(string.format("Used Ability on Unit #%d (%s)", a.placementIndex, tostring(a.towerName)))
-                end
-                task.wait(0.15)
             end
         end)
     end
@@ -1603,10 +1340,10 @@ local function executeReplay(macroData)
     setMatchStatusText(not isMatchActive() and "🏁 Match Ended" or "✅ Replay Complete")
 end
 
--- ==================== 8. BUILD OBSIDIAN WINDOW & TABS (MATCH EDITION) ====================
+-- ==================== 8. BUILD OBSIDIAN WINDOW & TABS ====================
 local Window = Library:CreateWindow({
-    Title                = "⚡ CAMERA TD // MATCH STUDIO v6.0",
-    Footer               = "v6.0 Modular Match Engine | Godly $27k Fix",
+    Title                = "⚡ CAMERA TD // STUDIO v5.4",
+    Footer               = "v5.4 Obsidian Edition | Dynamic Configs",
     Position             = UDim2.fromOffset(28, 70),
     Size                 = UDim2.fromOffset(660, 490),
     NotifySide           = "Right",
@@ -1625,7 +1362,7 @@ local Tabs = {
     Settings = Window:AddTab("Logs & UI", "settings")
 }
 
--- ---------- TAB 1: MACRO STUDIO ----------
+-- ---------- TAB: MACRO STUDIO ----------
 local MacroCtrlGroup     = Tabs.Macro:AddLeftGroupbox("Macro Controls", "film")
 local MacroTimelineGroup = Tabs.Macro:AddRightGroupbox("Action Timeline", "list-ordered")
 
@@ -1656,6 +1393,9 @@ MacroCtrlGroup:AddDropdown("MacroFileSelect", {
         local clean = cleanStr(Value)
         if clean ~= "" then
             S.macroName = clean
+            if Options.MacroNameInput then
+                pcall(function() Options.MacroNameInput:SetValue(clean) end)
+            end
             loadMacroByName(clean)
         end
     end
@@ -1672,8 +1412,15 @@ MacroCtrlGroup:AddButton({
     Text = "📂 Load",
     Func = function()
         safeCall("LoadMacroBtn", function()
-            local target = Options.MacroNameInput and Options.MacroNameInput.Value or S.macroName
+            local selectedDrop = Options.MacroFileSelect and cleanStr(Options.MacroFileSelect.Value)
+            local inputName    = Options.MacroNameInput and cleanStr(Options.MacroNameInput.Value)
+            local target       = (inputName and inputName ~= "" and isfile and isfile(MACRO_FOLDER .. "/" .. inputName .. ".json") and inputName)
+                or (selectedDrop and selectedDrop ~= "" and selectedDrop)
+                or S.macroName
             if loadMacroByName(target) then
+                if Options.MacroNameInput then
+                    pcall(function() Options.MacroNameInput:SetValue(target) end)
+                end
                 notify("Macro Loaded", "Loaded profile: " .. tostring(target), 3)
             else
                 notify("Macro Load Failed", "File not found: " .. tostring(target), 3)
@@ -1717,7 +1464,7 @@ MacroCtrlGroup:AddToggle("RecordMacroToggle", {
     Callback = function(Value)
         safeCall("RecordMacroToggle", function()
             if Value then
-                loadAllTowerConfigs()
+                syncGameTowerConfigs()
                 if S.replaying then
                     S.replaying = false
                     if Toggles.ReplayMacroToggle then Toggles.ReplayMacroToggle:SetValue(false) end
@@ -1736,7 +1483,6 @@ MacroCtrlGroup:AddToggle("RecordMacroToggle", {
                 if not S.recording then return end
                 S.recording = false
                 local profName = (Options.MacroNameInput and Options.MacroNameInput.Value ~= "" and Options.MacroNameInput.Value) or S.macroName
-                repairMacroActions(recData.actions)
                 syncMacroFromRec(profName)
                 setMatchStatusText(string.format("⏹ Recorded %d Actions", #recData.actions))
                 addLog(string.format("⏹ RECORDING STOPPED (%d Actions)", #recData.actions))
@@ -1766,7 +1512,7 @@ MacroCtrlGroup:AddToggle("ReplayMacroToggle", {
                 if Toggles.RecordMacroToggle then Toggles.RecordMacroToggle:SetValue(false) end
             end
             local d = S.macro
-            local profName = (Options.MacroNameInput and Options.MacroNameInput.Value ~= "" and Options.MacroNameInput.Value) or S.macroName
+            local profName = (Options.MacroFileSelect and cleanStr(Options.MacroFileSelect.Value) ~= "" and cleanStr(Options.MacroFileSelect.Value)) or S.macroName
             if not d or not d.actions or #d.actions == 0 then
                 if #recData.actions > 0 then
                     syncMacroFromRec(profName)
@@ -1846,7 +1592,7 @@ StatusLabels.MacroSummary = MacroTimelineGroup:AddLabel("Profile: None | Actions
 MacroTimelineGroup:AddDivider()
 StatusLabels.Timeline     = MacroTimelineGroup:AddLabel("No actions recorded or loaded.", true)
 
--- ---------- TAB 2: IN-GAME AUTOMATION ----------
+-- ---------- TAB: IN-GAME AUTOMATION ----------
 local WaveSkipGroup  = Tabs.Match:AddLeftGroupbox("Wave-Skip Filter", "fast-forward")
 local MatchAutoGroup = Tabs.Match:AddRightGroupbox("Match Automation", "bot")
 
@@ -1957,18 +1703,7 @@ MatchAutoGroup:AddToggle("AutoPlayMacroToggle", {
     end
 })
 
-MatchAutoGroup:AddButton({
-    Text = "🚪 Leave Match To Lobby",
-    Func = function()
-        pcall(function()
-            if Remotes.OnLeave then
-                Remotes.OnLeave:FireServer()
-            end
-        end)
-    end
-})
-
--- ---------- TAB 3: PERFORMANCE & AUTO-EXECUTE ----------
+-- ---------- TAB: PERFORMANCE & AUTO-EXECUTE ----------
 local ExecGroup = Tabs.PerfExec:AddLeftGroupbox("Teleport Auto-Execute", "rocket")
 local PerfGroup = Tabs.PerfExec:AddRightGroupbox("FPS Cap & Anti-Lag", "gauge")
 
@@ -2048,7 +1783,7 @@ PerfGroup:AddToggle("DisableVFXToggle", {
     end
 })
 
--- ---------- TAB 4: LOGS & UI SETTINGS ----------
+-- ---------- TAB: LOGS & UI SETTINGS ----------
 local LogGroup  = Tabs.Settings:AddLeftGroupbox("Live Console Log", "terminal")
 local MenuGroup = Tabs.Settings:AddRightGroupbox("Menu Controls", "wrench")
 
@@ -2059,7 +1794,7 @@ LogGroup:AddButton({
         setLabel(StatusLabels.Console, "Console cleared.")
     end
 })
-StatusLabels.Console = LogGroup:AddLabel("Initializing Match Studio...", true)
+StatusLabels.Console = LogGroup:AddLabel("Initializing Camera TD Suite...", true)
 
 MenuGroup:AddToggle("ShowCustomCursor", {
     Text    = "Custom Cursor",
@@ -2110,11 +1845,11 @@ end)
 
 function Controller.Unload()
     if Controller.Unloaded then return end
-    Controller.Unloaded = true
-    Controller.Running  = false
-    _G.__CAM_TD_MACRO   = false
-    S.recording         = false
-    S.replaying         = false
+    Controller.Unloaded  = true
+    Controller.Running   = false
+    _G.__CAM_TD_MACRO    = false
+    S.recording          = false
+    S.replaying          = false
     ENV.__CAM_TD_HOOK_CB = nil
     saveS()
     for _, c in ipairs(Controller.Connections) do
@@ -2128,23 +1863,23 @@ Library:OnUnload(function()
     Controller.Unload()
 end)
 
--- ==================== 9. MATCH ENGINE LINKER & SUPERVISOR LOOP ====================
+-- ==================== 9. ENGINE LINKER & SUPERVISOR LOOP (SAME STRUCTURE AS v5.3) ====================
 task.spawn(function()
-    local loadedCount = loadAllTowerConfigs()
-    addLog(string.format("Loaded %d Tower Configs (UTCM Lvl 6 = $%d)", loadedCount, getTowerUpgradeCost("Upgraded Titan Cameraman", 6)))
+    addLog("Initializing Camera TD Engine (v5.4 Obsidian)...")
+    syncGameTowerConfigs()
     pcall(function() loadMacroByName(S.macroName) end)
     updateMacroTimelineUI()
 
     while Controller.Running do
-        safeCall("MatchEngineLinker", function()
+        safeCall("EngineLinker", function()
             playerGui    = LP:FindFirstChildOfClass("PlayerGui")
             gameUI       = playerGui and playerGui:FindFirstChild("GameUI")
             gameFolder   = workspace:FindFirstChild("Game")
             towersFolder = gameFolder and gameFolder:FindFirstChild("Towers")
 
             if next(ConfigTowers) == nil then
-                local cnt = loadAllTowerConfigs()
-                if cnt > 0 then
+                syncGameTowerConfigs()
+                if next(ConfigTowers) ~= nil then
                     if S.macro and S.macro.actions then
                         repairMacroActions(S.macro.actions)
                     end
@@ -2160,33 +1895,33 @@ task.spawn(function()
                 local rf  = net and net:FindFirstChild("RemoteFunction")
 
                 if re and rf then
+                    Remotes.Replication  = re:FindFirstChild("Replication")
                     Remotes.TowerAdd     = re:FindFirstChild("TowerAdd")
                     Remotes.TowerUpgrade = re:FindFirstChild("TowerUpgrade")
                     Remotes.TowerSell    = re:FindFirstChild("TowerSell")
                     Remotes.TowerTarget  = re:FindFirstChild("TowerTarget")
                     Remotes.TowerRemove  = re:FindFirstChild("TowerRemove")
-                    Remotes.TowerAbility = re:FindFirstChild("TowerAbility")
                     Remotes.ModeVote     = re:FindFirstChild("ModeVote")
                     Remotes.WaveSkip     = re:FindFirstChild("WaveSkip")
                     Remotes.PlayAgain    = re:FindFirstChild("PlayAgain")
-                    Remotes.OnLeave      = re:FindFirstChild("OnLeave")
                     Remotes.ChangeSpeed  = rf:FindFirstChild("ChangeSpeed")
 
                     if Remotes.TowerAdd and Remotes.TowerUpgrade then
                         bindMatchRemoteListeners()
                         if S.disableVFX then applyVFXSetting(true) end
                         MatchEngineReady = true
-                        addLog("✅ Match Remotes & GameReplicator Linked!")
+                        addLog("✅ Match Remotes & Tower Configs Linked!")
                     end
                 end
             end
         end)
+
         task.wait(1.5)
     end
 end)
 
 task.spawn(function()
-    local lastBlockedWaveLog  = 0
+    local lastBlockedWaveLog   = 0
     local lastPlayAgainAttempt = 0
     local lastSpeedAttemptTime = 0
     local speedFailCount       = 0
@@ -2301,7 +2036,7 @@ task.spawn(function()
                     table.clear(UsedTowerIds)
                     table.clear(ActiveTowerLevels)
                     updateMacroTimelineUI()
-                    addLog("⏹ Replay Reset: Match transitioned to Voting/Restarting.")
+                    addLog("⏹ Replay Reset: Match transitioned to Voting/Lobby.")
                 end
 
                 -- 6. AutoPlay Trigger on Wave >= 1
@@ -2366,4 +2101,4 @@ task.spawn(function()
     end
 end)
 
-notify("Camera TD Match v6.0", "In-Game Match Studio Loaded!", 4)
+notify("Camera TD v5.4 Loaded", "In-Game Match Mode Active!", 4)
