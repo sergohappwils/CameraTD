@@ -1,14 +1,5 @@
 -- ============================================================================
--- CAMERA TD // MATCH STUDIO MODULE (Match.lua v5.8)
--- Fixes:
---   1. Complete single-file build (no split/EOF syntax errors)
---   2. Safe mid-match & mid-replay resume (HomePos matching, live Level &
---      TargetMode checks, sold early-unit detection, fast 0.25s remote linking)
---   3. Lobby & Auto-TP Control inside In-Game Auto tab (can disable Auto TP
---      from inside a match + double-click Return To Lobby)
---   4. Pre-yield Singleton Guard + Obsidian ScreenGui cleanup
---   5. Removed hookmetamethod (reads UnitId from TowerAdd.OnClientEvent)
---   6. Co-op ownership filter + RemoteSecurity delay pacing + Mobile sizing
+-- CAMERA TD // MATCH STUDIO MODULE (Match.lua v5.9)
 -- ============================================================================
 
 if not game:IsLoaded() then
@@ -252,7 +243,6 @@ pcall(function()
 end)
 
 local DEFAULTS = {
-    -- Lobby Settings (Synced with Lobby.lua)
     autoJoinMatch       = false,
     selectedMap         = "Toilet City",
     joinMethod          = "Teleport",
@@ -264,7 +254,6 @@ local DEFAULTS = {
     summonAmount        = "10x",
     autoDismissLoading  = true,
 
-    -- In-Game Settings
     autoSpeed           = true,
     speedChoice         = 2,
     autoVoteMode        = true,
@@ -293,6 +282,7 @@ S.summonCrate  = cleanStr(S.summonCrate)
 S.summonAmount = cleanStr(S.summonAmount)
 S.selectedMode = cleanStr(S.selectedMode)
 S.macroName    = cleanStr(S.macroName)
+S.speedChoice  = tonumber(S.speedChoice) or 2
 
 pcall(function()
     if S.syncSkipMultiAcc and isfile and readfile and isfile(SHARED_SKIP_FILE) then
@@ -312,7 +302,7 @@ S.totalSteps       = 0
 S.currentStepText  = "Idle"
 S.teleportQueued   = ENV.__CAM_TD_TP_ARMED == true
 
-local recData = { version = 5.8, actions = {} }
+local recData = { version = 5.9, actions = {} }
 
 local function saveS()
     pcall(function()
@@ -809,6 +799,9 @@ local ActiveTowerLevels        = {}
 local ActiveTowerModes         = {}
 local suppressDropdownCallback = false
 
+local lastSkipAttempt          = 0
+local lastBlockedWaveLog       = 0
+
 local function getReplicatorTowerEntry(tId)
     local entry = nil
     pcall(function()
@@ -1032,7 +1025,29 @@ local function loadMacroByName(name)
     return false
 end
 
+local function tryAutoSkipWave()
+    local autoSkipOn = (Toggles and Toggles.AutoSkipToggle and Toggles.AutoSkipToggle.Value == true)
+    if not autoSkipOn or not isMatchActive() or not Remotes.WaveSkip then return end
+    if workspace:GetAttribute("CanSkip") ~= true then return end
+    local curWave = tonumber(workspace:GetAttribute("Wave")) or 0
+    if isWaveSkipBlocked(curWave, S.noSkipWaves) then
+        if lastBlockedWaveLog ~= curWave then
+            lastBlockedWaveLog = curWave
+            addLog(string.format("🛑 Auto-Skip paused on Wave %d (Filter: %s)", curWave, S.noSkipWaves))
+        end
+    elseif tick() - lastSkipAttempt >= 0.75 then
+        lastSkipAttempt = tick()
+        pcall(function() Remotes.WaveSkip:FireServer() end)
+    end
+end
+
 local function bindMatchRemoteListeners()
+    trackConn(workspace:GetAttributeChangedSignal("CanSkip"):Connect(function()
+        if workspace:GetAttribute("CanSkip") == true then
+            tryAutoSkipWave()
+        end
+    end))
+
     if Remotes.TowerAdd then
         trackConn(Remotes.TowerAdd.OnClientEvent:Connect(function(data)
             safeCall("TowerAddListener", function()
@@ -1287,7 +1302,6 @@ local function executeReplay(macroData)
     S.totalSteps       = #macroData.actions
     S.currentStepIndex = 0
 
-    -- Mid-match resume detection: identify already-present towers & sold early units
     local soldAtStep = {}
     local highestPresentStep = 0
     for idx, act in ipairs(macroData.actions) do
@@ -1340,7 +1354,6 @@ local function executeReplay(macroData)
                     return
                 end
 
-                -- If re-executing mid-game after this unit was already placed & sold, skip re-buying it
                 local sStep = soldAtStep[a.placementIndex]
                 if sStep and sStep < highestPresentStep then
                     return
@@ -1466,7 +1479,6 @@ local function executeReplay(macroData)
                 if liveMode and desiredMode and liveMode == desiredMode then
                     return
                 end
-                -- If consecutive target steps exist for this tower and it is already at the final mode of that burst, skip
                 if liveMode then
                     local burstFinal = desiredMode
                     for k = i + 1, #macroData.actions do
@@ -1501,7 +1513,7 @@ local function executeReplay(macroData)
     setMatchStatusText(not isMatchActive() and "🏁 Match Ended" or "✅ Replay Complete")
 end
 
--- ==================== 7. BUILD OBSIDIAN WINDOW & TABS (RESPONSIVE MOBILE + PC) ====================
+-- ==================== 7. BUILD OBSIDIAN WINDOW & TABS ====================
 local cam      = workspace.CurrentCamera
 local vp       = cam and cam.ViewportSize or Vector2.new(1280, 720)
 local isMobile = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
@@ -1511,8 +1523,8 @@ local posX     = isMobile and math.max(10, math.floor((vp.X - winW) * 0.5)) or 2
 local posY     = isMobile and math.max(16, math.floor((vp.Y - winH) * 0.5)) or 54
 
 local Window = Library:CreateWindow({
-    Title                = "⚡ CAMERA TD // STUDIO v5.8",
-    Footer               = "v5.8 Obsidian Edition | Match Studio",
+    Title                = "⚡ CAMERA TD // STUDIO v5.9",
+    Footer               = "v5.9 Obsidian Edition | Match Studio",
     Position             = UDim2.fromOffset(posX, posY),
     Size                 = UDim2.fromOffset(winW, winH),
     NotifySide           = "Right",
@@ -1812,6 +1824,9 @@ WaveSkipGroup:AddToggle("AutoSkipToggle", {
     Callback = function(Value)
         S.autoSkip = Value
         saveS()
+        if Value then
+            task.spawn(tryAutoSkipWave)
+        end
     end
 })
 
@@ -1914,13 +1929,19 @@ LobbyReturnGroup:AddButton({
     end
 })
 
+local isSettingSpeed       = false
 local speedRejectedInMatch = false
+local speedFailCount       = 0
+local lastSpeedAttemptTime = 0
+
 MatchAutoGroup:AddToggle("AutoSpeedToggle", {
     Text    = "Auto Game Speed",
     Default = S.autoSpeed,
     Callback = function(Value)
         S.autoSpeed = Value
         speedRejectedInMatch = false
+        speedFailCount       = 0
+        lastSpeedAttemptTime = 0
         saveS()
     end
 })
@@ -1938,6 +1959,8 @@ MatchAutoGroup:AddDropdown("SpeedChoiceDropdown", {
         local clean = cleanStr(Value)
         S.speedChoice = speedMap[clean] or 2
         speedRejectedInMatch = false
+        speedFailCount       = 0
+        lastSpeedAttemptTime = 0
         saveS()
     end
 })
@@ -2140,7 +2163,7 @@ Library:OnUnload(function()
 end)
 
 -- ==================== 8. PRELOAD PROFILE & ENGINE LINKER + SUPERVISOR ====================
-addLog("Initializing Camera TD Engine (v5.8 Obsidian)...")
+addLog("Initializing Camera TD Engine (v5.9 Obsidian)...")
 pcall(function() loadMacroByName(S.macroName) end)
 updateMacroTimelineUI()
 
@@ -2190,12 +2213,8 @@ task.spawn(function()
 end)
 
 task.spawn(function()
-    local lastBlockedWaveLog   = 0
     local lastPlayAgainAttempt = 0
-    local lastSpeedAttemptTime = 0
     local lastModeVoteAttempt  = 0
-    local lastSkipAttempt      = 0
-    local speedFailCount       = 0
 
     while Controller.Running do
         safeCall("MatchSupervisor", function()
@@ -2219,36 +2238,69 @@ task.spawn(function()
             end
 
             if MatchEngineReady then
-                -- 1. Smart Game Speed Enforcer
+                -- 1. Non-blocking Smart Game Speed Enforcer (resilient to BUSY/RATE_LIMIT)
                 local autoSpeedOn = (Toggles.AutoSpeedToggle and Toggles.AutoSpeedToggle.Value == true)
-                if autoSpeedOn and isPlaying and Remotes.ChangeSpeed and not speedRejectedInMatch then
+                if autoSpeedOn and isPlaying and Remotes.ChangeSpeed and not speedRejectedInMatch and not isSettingSpeed then
+                    local dropVal     = Options.SpeedChoiceDropdown and cleanStr(Options.SpeedChoiceDropdown.Value)
+                    local targetSpeed = (dropVal and speedMap[dropVal]) or tonumber(S.speedChoice) or 2
                     local curSpeed    = tonumber(workspace:GetAttribute("GameSpeed")) or 1
-                    local targetSpeed = tonumber(S.speedChoice) or 2
-                    if curSpeed ~= targetSpeed then
-                        if tick() - lastSpeedAttemptTime >= 4.0 then
+
+                    if math.abs(curSpeed - targetSpeed) > 0.01 then
+                        if tick() - lastSpeedAttemptTime >= 1.5 then
                             lastSpeedAttemptTime = tick()
-                            pcall(function() Remotes.ChangeSpeed:InvokeServer(targetSpeed) end)
-                            task.wait(0.3)
-                            local afterSpeed = tonumber(workspace:GetAttribute("GameSpeed")) or 1
-                            if afterSpeed ~= targetSpeed then
-                                speedFailCount += 1
-                                if speedFailCount >= 2 then
-                                    if targetSpeed == 2 then
-                                        pcall(function() Remotes.ChangeSpeed:InvokeServer(1.5) end)
+                            isSettingSpeed = true
+                            task.spawn(function()
+                                local ok, res, errCode = pcall(function()
+                                    return Remotes.ChangeSpeed:InvokeServer(targetSpeed)
+                                end)
+                                local waitUntil = tick() + 0.8
+                                while tick() < waitUntil and Controller.Running do
+                                    local liveSpeed = tonumber(workspace:GetAttribute("GameSpeed")) or 1
+                                    if math.abs(liveSpeed - targetSpeed) <= 0.01 then
+                                        break
                                     end
-                                    speedRejectedInMatch = true
-                                    addLog("Speed " .. tostring(targetSpeed) .. "x locked on this account; stopped speed requests.")
+                                    task.wait(0.05)
                                 end
-                            else
-                                speedFailCount = 0
-                            end
+                                local afterSpeed = tonumber(workspace:GetAttribute("GameSpeed")) or 1
+                                if math.abs(afterSpeed - targetSpeed) <= 0.01 or res == true then
+                                    speedFailCount = 0
+                                    addLog("⚡ Game Speed set to " .. tostring(targetSpeed) .. "x")
+                                else
+                                    local codeStr = tostring(errCode or "")
+                                    local isTransient = (not ok)
+                                        or codeStr == "BUSY"
+                                        or codeStr == "RATE_LIMIT"
+                                        or codeStr == "SERVER_BUSY"
+                                        or codeStr == "NO_SESSION"
+                                    if isTransient then
+                                        speedFailCount = 0
+                                    else
+                                        speedFailCount += 1
+                                        if speedFailCount >= 3 then
+                                            if targetSpeed == 2 then
+                                                addLog("2x Speed locked on this account; switching to 1.5x Speed.")
+                                                S.speedChoice = 1.5
+                                                saveS()
+                                                if Options.SpeedChoiceDropdown then
+                                                    pcall(function() Options.SpeedChoiceDropdown:SetValue("1.5x Speed") end)
+                                                end
+                                                speedFailCount = 0
+                                            else
+                                                speedRejectedInMatch = true
+                                                addLog("Speed " .. tostring(targetSpeed) .. "x locked on this account; stopped speed requests.")
+                                            end
+                                        end
+                                    end
+                                end
+                                isSettingSpeed = false
+                            end)
                         end
                     else
                         speedFailCount = 0
                     end
                 end
 
-                -- 2. Gamemode Auto-Vote (Rate-limit safe >= 1.0s)
+                -- 2. Gamemode Auto-Vote
                 local autoVoteOn = (Toggles.AutoVoteModeToggle and Toggles.AutoVoteModeToggle.Value == true)
                 if autoVoteOn and isVoting and Remotes.ModeVote and (tick() - lastModeVoteAttempt >= 1.0) then
                     local modeClean = cleanStr((Options.VoteModeDropdown and Options.VoteModeDropdown.Value) or S.selectedMode)
@@ -2267,21 +2319,8 @@ task.spawn(function()
                     end
                 end
 
-                -- 3. Wave Skip Enforcer (Rate-limit safe >= 0.75s)
-                local autoSkipOn = (Toggles.AutoSkipToggle and Toggles.AutoSkipToggle.Value == true)
-                if autoSkipOn and isPlaying and Remotes.WaveSkip then
-                    if workspace:GetAttribute("CanSkip") == true then
-                        if isWaveSkipBlocked(curWave, S.noSkipWaves) then
-                            if lastBlockedWaveLog ~= curWave then
-                                lastBlockedWaveLog = curWave
-                                addLog(string.format("🛑 Auto-Skip paused on Wave %d (Filter: %s)", curWave, S.noSkipWaves))
-                            end
-                        elseif tick() - lastSkipAttempt >= 0.75 then
-                            lastSkipAttempt = tick()
-                            pcall(function() Remotes.WaveSkip:FireServer() end)
-                        end
-                    end
-                end
+                -- 3. Wave Skip Enforcer
+                tryAutoSkipWave()
 
                 -- 4. Verified Auto Play Again
                 if isOver then
@@ -2290,6 +2329,7 @@ task.spawn(function()
                     end
                     speedRejectedInMatch = false
                     speedFailCount       = 0
+                    lastSpeedAttemptTime = 0
                     if S.autoExecute and ENV.__CAM_TD_TP_ARMED ~= true then
                         armAutoExecute(false)
                     end
@@ -2341,6 +2381,8 @@ task.spawn(function()
 
                 if not isPlaying or curWave == 0 then
                     S.macroPlayed = false
+                    speedRejectedInMatch = false
+                    speedFailCount       = 0
                 end
             end
 
@@ -2377,4 +2419,4 @@ task.spawn(function()
     end
 end)
 
-notify("Camera TD v5.8 Loaded", "In-Game Match Mode Active!", 4)
+notify("Camera TD v5.9 Loaded", "In-Game Match Mode Active!", 4)
