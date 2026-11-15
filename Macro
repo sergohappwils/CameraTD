@@ -1,21 +1,33 @@
 -- ============================================================================
--- CAMERA TD // UNIVERSAL HUB LOADER (v6.0)
+-- CAMERA TD // UNIVERSAL HUB LOADER (v6.1)
 -- Repo: https://github.com/sergohappwils/CameraTD
--- Automatically detects Lobby vs. Match (any map) with Offline Cache Fallback
+-- Fixes:
+--   1. Strict sequence mutex (__CAM_TD_LOADER_SEQ) prevents duplicate runs
+--   2. Respects autoExecute setting & never resets __CAM_TD_TP_ARMED on re-exec
+--   3. Dedupe lock inside teleport payload stops mobile queue stacking
+--   4. Skips bootDelay on manual in-game re-exec; detects Trading Plaza PlaceId
 -- ============================================================================
 
 if not game:IsLoaded() then
     game.Loaded:Wait()
 end
 
-local REPO_BASE   = "https://raw.githubusercontent.com/sergohappwils/CameraTD/refs/heads/main/"
-local LOADER_URL  = REPO_BASE .. "Macro"
-local LOBBY_URL   = REPO_BASE .. "Lobby.lua"
-local MATCH_URL   = REPO_BASE .. "Match.lua"
+local ENV = (getgenv and getgenv()) or _G
+local myLoaderSeq = (ENV.__CAM_TD_LOADER_SEQ or 0) + 1
+ENV.__CAM_TD_LOADER_SEQ = myLoaderSeq
 
-local FOLDER      = "CameraTD_Macro"
-local DELAY_FILE  = FOLDER .. "/startup_delay.txt"
-local CACHE_DIR   = FOLDER .. "/cache"
+local function isSuperseded()
+    return ENV.__CAM_TD_LOADER_SEQ ~= myLoaderSeq
+end
+
+local REPO_BASE    = "https://raw.githubusercontent.com/sergohappwils/CameraTD/refs/heads/main/"
+local LOADER_URL   = REPO_BASE .. "Macro"
+local LOBBY_URL    = REPO_BASE .. "Lobby.lua"
+local MATCH_URL    = REPO_BASE .. "Match.lua"
+
+local FOLDER       = "CameraTD_Macro"
+local DELAY_FILE   = FOLDER .. "/startup_delay.txt"
+local CACHE_DIR    = FOLDER .. "/cache"
 local LOADER_CACHE = CACHE_DIR .. "/loader_cache.luau"
 local LOBBY_CACHE  = CACHE_DIR .. "/lobby_cache.luau"
 local MATCH_CACHE  = CACHE_DIR .. "/match_cache.luau"
@@ -27,26 +39,58 @@ pcall(function()
     end
 end)
 
+local Players     = game:GetService("Players")
+local HttpService = game:GetService("HttpService")
+local LP          = Players.LocalPlayer or Players.PlayerAdded:Wait()
+
 -- 1. Read user-configured startup delay (Default: 7s)
 local bootDelay = 7
 pcall(function()
     if isfile and readfile and isfile(DELAY_FILE) then
-        local num = tonumber(readfile(DELAY_FILE):match("([%d%.]+)"))
+        local matchStr = readfile(DELAY_FILE):match("([%d%.]+)")
+        local num = matchStr and tonumber(matchStr, 10)
         if num and num >= 1 and num <= 60 then
             bootDelay = num
         end
     end
 end)
 
-task.wait(bootDelay)
+local fromTeleport = (ENV.__CAM_TD_FROM_TP == true)
+ENV.__CAM_TD_FROM_TP = nil
 
-local Players = game:GetService("Players")
-local LP = Players.LocalPlayer or Players.PlayerAdded:Wait()
+-- Wait bootDelay on teleport/initial join, but avoid blind wait if user manually re-runs in an active server
+if fromTeleport or workspace.DistributedGameTime < 12 then
+    print(string.format("[CameraTD Loader] Waiting %ss before launch...", tostring(bootDelay)))
+    task.wait(bootDelay)
+end
 
--- 2. Arm queue_on_teleport immediately so every teleport re-runs the Loader
-local ENV = (getgenv and getgenv()) or _G
+if isSuperseded() then
+    return
+end
+
+-- 2. Check saved autoExecute preference before arming teleport queue
+local function shouldAutoExecute()
+    local enabled = true
+    pcall(function()
+        if isfile and readfile then
+            local settingsPath = FOLDER .. "/" .. LP.Name .. "_settings.json"
+            if isfile(settingsPath) then
+                local ok, decoded = pcall(function()
+                    return HttpService:JSONDecode(readfile(settingsPath))
+                end)
+                if ok and type(decoded) == "table" and decoded.autoExecute == false then
+                    enabled = false
+                end
+            end
+        end
+    end)
+    return enabled
+end
+
 local function armTeleportQueue()
-    if ENV.__CAM_TD_TP_ARMED then return end
+    if ENV.__CAM_TD_TP_ARMED == true then
+        return
+    end
     local qFunc = queue_on_teleport
         or queueonteleport
         or (syn and syn.queue_on_teleport)
@@ -57,6 +101,11 @@ local function armTeleportQueue()
     if not qFunc then return end
 
     local payload = string.format([[
+        local E = (getgenv and getgenv()) or _G
+        local now = os.clock()
+        if E.__CAM_TD_PAYLOAD_LOCK and (now - E.__CAM_TD_PAYLOAD_LOCK) < 4 then return end
+        E.__CAM_TD_PAYLOAD_LOCK = now
+        E.__CAM_TD_FROM_TP = true
         if not game:IsLoaded() then game.Loaded:Wait() end
         local ok, src = pcall(function()
             return game:HttpGet(%q .. "?t=" .. tostring(os.time()))
@@ -77,18 +126,27 @@ local function armTeleportQueue()
     end
 end
 
-ENV.__CAM_TD_TP_ARMED = false
-armTeleportQueue()
+if shouldAutoExecute() then
+    armTeleportQueue()
+end
 
--- 3. Wait up to 15s for Workspace / PlayerGui markers so place detection is 100% accurate
+-- 3. Accurate Place Detection (Lobby / Match / Trading Plaza)
 local function detectPlaceType()
-    local lobbyPlaceId = 132929771812494
+    local lobbyPlaceId   = 132929771812494
+    local matchPlaceId   = 114068177100380
+    local tradingPlaceId = 85725785704440
+
     if game.PlaceId == lobbyPlaceId then
         return "LOBBY"
+    elseif game.PlaceId == tradingPlaceId then
+        return "TRADING_PLAZA"
+    elseif game.PlaceId == matchPlaceId then
+        return "MATCH"
     end
 
     local deadline = os.clock() + 15
     while os.clock() < deadline do
+        if isSuperseded() then return "CANCELLED" end
         if workspace:FindFirstChild("Game") then
             return "MATCH"
         end
@@ -113,6 +171,7 @@ end
 local function fetchAndExecute(url, cachePath, label)
     local src = nil
     for attempt = 1, 3 do
+        if isSuperseded() then return false end
         local ok, res = pcall(function()
             return game:HttpGet(url .. "?t=" .. tostring(os.time()))
         end)
@@ -125,6 +184,8 @@ local function fetchAndExecute(url, cachePath, label)
         end
         task.wait(0.8)
     end
+
+    if isSuperseded() then return false end
 
     if not src then
         pcall(function()
@@ -149,13 +210,21 @@ local function fetchAndExecute(url, cachePath, label)
         return false
     end
 
+    if isSuperseded() then return false end
+
     print("[CameraTD Loader] Launching " .. label .. "...")
     task.spawn(fn)
     return true
 end
 
 local placeType = detectPlaceType()
-if placeType == "LOBBY" then
+if isSuperseded() or placeType == "CANCELLED" then
+    return
+end
+
+if placeType == "TRADING_PLAZA" then
+    print("[CameraTD Loader] Trading Plaza detected; standing by for Lobby/Match.")
+elseif placeType == "LOBBY" then
     fetchAndExecute(LOBBY_URL, LOBBY_CACHE, "Lobby Module (Lobby.lua)")
 else
     fetchAndExecute(MATCH_URL, MATCH_CACHE, "Match Module (Match.lua)")
