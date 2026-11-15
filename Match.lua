@@ -1,5 +1,6 @@
+
 -- ============================================================================
--- CAMERA TD // MATCH STUDIO MODULE (Match.lua v5.9)
+-- CAMERA TD // MATCH STUDIO MODULE (Match.lua v6.0)
 -- ============================================================================
 
 if not game:IsLoaded() then
@@ -302,7 +303,7 @@ S.totalSteps       = 0
 S.currentStepText  = "Idle"
 S.teleportQueued   = ENV.__CAM_TD_TP_ARMED == true
 
-local recData = { version = 5.9, actions = {} }
+local recData = { version = 6.0, actions = {} }
 
 local function saveS()
     pcall(function()
@@ -538,7 +539,7 @@ task.spawn(function()
     end
 end)
 
--- ==================== 5. IN-GAME STATE & DYNAMIC CONFIG HELPERS ====================
+-- ==================== 5. IN-GAME STATE, SPEED & DYNAMIC CONFIG HELPERS ====================
 local playerGui        = LP:FindFirstChildOfClass("PlayerGui")
 local gameUI           = playerGui and playerGui:FindFirstChild("GameUI")
 local gameFolder       = workspace:FindFirstChild("Game")
@@ -548,6 +549,32 @@ local ConfigModule     = nil
 local ConfigTowers     = {}
 local Remotes          = {}
 local MatchEngineReady = false
+
+local function getNetworkRemote(name)
+    local found = nil
+    pcall(function()
+        if shared and shared.Modules and shared.Modules.Network and type(shared.Modules.Network.Get) == "function" then
+            found = shared.Modules.Network.Get(name)
+        end
+        if not found then
+            local ml  = RS:FindFirstChild("ModuleLoader")
+            local sh  = ml and ml:FindFirstChild("Shared")
+            local net = sh and sh:FindFirstChild("Network")
+            if net then
+                for _, folder in ipairs(net:GetChildren()) do
+                    if folder:IsA("Folder") then
+                        local r = folder:FindFirstChild(name)
+                        if r then
+                            found = r
+                            break
+                        end
+                    end
+                end
+            end
+        end
+    end)
+    return found
+end
 
 local function loadDynamicTowerConfigs()
     pcall(function()
@@ -784,6 +811,204 @@ local function resolveUnitIdForTower(towerName, fallbackId)
         end
     end)
     return foundId or fallbackId or "1"
+end
+
+-- Robust GameSpeed Controller (HUD click + Direct ChangeSpeed RemoteFunction)
+local speedMap             = { ["1x Speed"] = 1, ["1.5x Speed"] = 1.5, ["2x Speed"] = 2 }
+local speedLabels          = { "1x Speed", "1.5x Speed", "2x Speed" }
+local isSettingSpeed       = false
+local speedRejectedInMatch = false
+local matchFallbackSpeed   = nil
+local speedFailCount       = 0
+local lastSpeedAttemptTime = 0
+local lastSpeedFailLog     = 0
+
+local function getSelectedSpeed()
+    if Options and Options.SpeedChoiceDropdown then
+        local raw = Options.SpeedChoiceDropdown.Value
+        if type(raw) == "string" then
+            local clean = cleanStr(raw)
+            if speedMap[clean] then return speedMap[clean] end
+            local num = tonumber(clean:match("([%d%.]+)"), 10)
+            if num == 1 or num == 1.5 or num == 2 then return num end
+        elseif type(raw) == "number" and speedLabels[raw] then
+            return speedMap[speedLabels[raw]]
+        elseif type(raw) == "table" then
+            for k, v in pairs(raw) do
+                if v == true and speedMap[cleanStr(k)] then
+                    return speedMap[cleanStr(k)]
+                end
+            end
+        end
+    end
+    local sVal = tonumber(S.speedChoice)
+    if sVal == 1 or sVal == 1.5 or sVal == 2 then
+        return sVal
+    end
+    return 2
+end
+
+local function updateGameSpeedHudHighlight(targetSpeed)
+    pcall(function()
+        if not gameUI then
+            playerGui = LP:FindFirstChildOfClass("PlayerGui")
+            gameUI = playerGui and playerGui:FindFirstChild("GameUI")
+        end
+        local gsFolder = gameUI and gameUI:FindFirstChild("GameSpeeds")
+        if not gsFolder then return end
+        local targetName = tostring(targetSpeed)
+        for _, child in ipairs(gsFolder:GetChildren()) do
+            if child:IsA("Frame") then
+                local shadow = child:FindFirstChild("TroopFrame")
+                    and child.TroopFrame:FindFirstChild("Background")
+                    and child.TroopFrame.Background:FindFirstChild("UIShadow")
+                if shadow then
+                    shadow.Color = (child.Name == targetName)
+                        and Color3.fromRGB(8, 138, 12)
+                        or Color3.fromRGB(0, 0, 0)
+                end
+            end
+        end
+    end)
+end
+
+local function clickGameSpeedHudButton(targetSpeed)
+    local clicked = false
+    pcall(function()
+        if not gameUI then
+            playerGui = LP:FindFirstChildOfClass("PlayerGui")
+            gameUI = playerGui and playerGui:FindFirstChild("GameUI")
+        end
+        local gsFolder = gameUI and gameUI:FindFirstChild("GameSpeeds")
+        local btnFrame = gsFolder and gsFolder:FindFirstChild(tostring(targetSpeed))
+        local btn = btnFrame and btnFrame:FindFirstChild("TroopFrame")
+            and btnFrame.TroopFrame:FindFirstChild("InteractiveButton")
+        if btn and btn:IsA("GuiButton") then
+            if firesignal then
+                pcall(function()
+                    firesignal(btn.Activated)
+                    clicked = true
+                end)
+                if not clicked then
+                    pcall(function()
+                        firesignal(btn.MouseButton1Click)
+                        clicked = true
+                    end)
+                end
+            end
+            if not clicked and getconnections then
+                pcall(function()
+                    for _, conn in ipairs(getconnections(btn.Activated)) do
+                        pcall(function() conn:Fire() end)
+                        clicked = true
+                    end
+                    for _, conn in ipairs(getconnections(btn.MouseButton1Click)) do
+                        pcall(function() conn:Fire() end)
+                        clicked = true
+                    end
+                end)
+            end
+        end
+    end)
+    return clicked
+end
+
+local function applyDesiredGameSpeed(forceNow)
+    if isSettingSpeed or not Controller.Running then return end
+    if not Remotes.ChangeSpeed or not Remotes.ChangeSpeed.Parent then
+        Remotes.ChangeSpeed = getNetworkRemote("ChangeSpeed")
+    end
+    local speedRf = Remotes.ChangeSpeed
+    if not speedRf then return end
+
+    local chosenSpeed = getSelectedSpeed()
+    local targetSpeed = matchFallbackSpeed or chosenSpeed
+    local curSpeed    = tonumber(workspace:GetAttribute("GameSpeed")) or 1
+
+    if math.abs(curSpeed - targetSpeed) <= 0.01 then
+        speedFailCount = 0
+        updateGameSpeedHudHighlight(targetSpeed)
+        return
+    end
+
+    if not forceNow and (tick() - lastSpeedAttemptTime < 1.5) then
+        return
+    end
+
+    lastSpeedAttemptTime = tick()
+    isSettingSpeed = true
+
+    task.spawn(function()
+        xpcall(function()
+            -- 1. Try clicking the native HUD GameSpeeds button first (highlights UI + invokes ChangeSpeed)
+            if clickGameSpeedHudButton(targetSpeed) then
+                local hudWait = tick() + 0.45
+                while tick() < hudWait and Controller.Running do
+                    local s = tonumber(workspace:GetAttribute("GameSpeed")) or 1
+                    if math.abs(s - targetSpeed) <= 0.01 then
+                        speedFailCount = 0
+                        updateGameSpeedHudHighlight(targetSpeed)
+                        addLog("⚡ Game Speed set to " .. tostring(targetSpeed) .. "x (HUD)")
+                        return
+                    end
+                    task.wait(0.05)
+                end
+            end
+
+            -- 2. Direct RemoteFunction invoke fallback
+            local ok, res, errCode = pcall(function()
+                return speedRf:InvokeServer(targetSpeed)
+            end)
+
+            local waitUntil = tick() + 0.8
+            while tick() < waitUntil and Controller.Running do
+                local liveSpeed = tonumber(workspace:GetAttribute("GameSpeed")) or 1
+                if math.abs(liveSpeed - targetSpeed) <= 0.01 then
+                    break
+                end
+                task.wait(0.05)
+            end
+
+            local afterSpeed = tonumber(workspace:GetAttribute("GameSpeed")) or 1
+            if math.abs(afterSpeed - targetSpeed) <= 0.01 or res == true then
+                speedFailCount = 0
+                updateGameSpeedHudHighlight(targetSpeed)
+                addLog("⚡ Game Speed set to " .. tostring(targetSpeed) .. "x")
+            else
+                local codeStr = tostring(errCode or "")
+                local isTransient = (not ok)
+                    or codeStr == "BUSY"
+                    or codeStr == "RATE_LIMIT"
+                    or codeStr == "SERVER_BUSY"
+                    or codeStr == "NO_SESSION"
+
+                if not isTransient and isMatchActive() then
+                    speedFailCount += 1
+                    if tick() - lastSpeedFailLog >= 5.0 then
+                        lastSpeedFailLog = tick()
+                        addLog(string.format(
+                            "Speed %sx rejected (ok=%s, res=%s, code=%s, current=%sx)",
+                            tostring(targetSpeed), tostring(ok), tostring(res), codeStr ~= "" and codeStr or "nil", tostring(afterSpeed)
+                        ))
+                    end
+                    if speedFailCount >= 4 then
+                        if targetSpeed == 2 then
+                            addLog("2x Speed unavailable on this account/match; trying 1.5x Speed.")
+                            matchFallbackSpeed = 1.5
+                            speedFailCount     = 0
+                            lastSpeedAttemptTime = 0
+                        else
+                            speedRejectedInMatch = true
+                            addLog("Speed " .. tostring(targetSpeed) .. "x locked on this account; stopped speed requests.")
+                        end
+                    end
+                end
+            end
+        end, function(err)
+            addLog("Speed worker error: " .. tostring(err), true)
+        end)
+        isSettingSpeed = false
+    end)
 end
 
 -- ==================== 6. MACRO RECORDING & REPLAY ENGINE ====================
@@ -1027,8 +1252,14 @@ end
 
 local function tryAutoSkipWave()
     local autoSkipOn = (Toggles and Toggles.AutoSkipToggle and Toggles.AutoSkipToggle.Value == true)
-    if not autoSkipOn or not isMatchActive() or not Remotes.WaveSkip then return end
+    if not autoSkipOn or not isMatchActive() then return end
     if workspace:GetAttribute("CanSkip") ~= true then return end
+
+    if not Remotes.WaveSkip or not Remotes.WaveSkip.Parent then
+        Remotes.WaveSkip = getNetworkRemote("WaveSkip")
+    end
+    if not Remotes.WaveSkip then return end
+
     local curWave = tonumber(workspace:GetAttribute("Wave")) or 0
     if isWaveSkipBlocked(curWave, S.noSkipWaves) then
         if lastBlockedWaveLog ~= curWave then
@@ -1046,6 +1277,11 @@ local function bindMatchRemoteListeners()
         if workspace:GetAttribute("CanSkip") == true then
             tryAutoSkipWave()
         end
+    end))
+
+    trackConn(workspace:GetAttributeChangedSignal("GameSpeed"):Connect(function()
+        local s = tonumber(workspace:GetAttribute("GameSpeed")) or 1
+        updateGameSpeedHudHighlight(s)
     end))
 
     if Remotes.TowerAdd then
@@ -1523,8 +1759,8 @@ local posX     = isMobile and math.max(10, math.floor((vp.X - winW) * 0.5)) or 2
 local posY     = isMobile and math.max(16, math.floor((vp.Y - winH) * 0.5)) or 54
 
 local Window = Library:CreateWindow({
-    Title                = "⚡ CAMERA TD // STUDIO v5.9",
-    Footer               = "v5.9 Obsidian Edition | Match Studio",
+    Title                = "⚡ CAMERA TD // STUDIO v6.0",
+    Footer               = "v6.0 Obsidian Edition | Match Studio",
     Position             = UDim2.fromOffset(posX, posY),
     Size                 = UDim2.fromOffset(winW, winH),
     NotifySide           = "Right",
@@ -1911,14 +2147,7 @@ LobbyReturnGroup:AddButton({
             if S.autoExecute and ENV.__CAM_TD_TP_ARMED ~= true then
                 armAutoExecute(false)
             end
-            local leaveEv = Remotes.OnLeave
-            if not leaveEv then
-                local ml  = RS:FindFirstChild("ModuleLoader")
-                local sh  = ml and ml:FindFirstChild("Shared")
-                local net = sh and sh:FindFirstChild("Network")
-                local re  = net and net:FindFirstChild("RemoteEvent")
-                leaveEv = re and re:FindFirstChild("OnLeave")
-            end
+            local leaveEv = Remotes.OnLeave or getNetworkRemote("OnLeave")
             if leaveEv then
                 leaveEv:FireServer()
                 addLog("🏠 Returning to Lobby...")
@@ -1929,27 +2158,23 @@ LobbyReturnGroup:AddButton({
     end
 })
 
-local isSettingSpeed       = false
-local speedRejectedInMatch = false
-local speedFailCount       = 0
-local lastSpeedAttemptTime = 0
-
 MatchAutoGroup:AddToggle("AutoSpeedToggle", {
     Text    = "Auto Game Speed",
     Default = S.autoSpeed,
     Callback = function(Value)
         S.autoSpeed = Value
         speedRejectedInMatch = false
+        matchFallbackSpeed   = nil
         speedFailCount       = 0
         lastSpeedAttemptTime = 0
         saveS()
+        if Value and MatchEngineReady then
+            applyDesiredGameSpeed(true)
+        end
     end
 })
 
-local speedMap        = { ["1x Speed"] = 1, ["1.5x Speed"] = 1.5, ["2x Speed"] = 2 }
-local speedLabels     = { "1x Speed", "1.5x Speed", "2x Speed" }
 local defaultSpeedIdx = (S.speedChoice == 1 and 1) or (S.speedChoice == 1.5 and 2) or 3
-
 MatchAutoGroup:AddDropdown("SpeedChoiceDropdown", {
     Values   = speedLabels,
     Default  = defaultSpeedIdx,
@@ -1957,11 +2182,20 @@ MatchAutoGroup:AddDropdown("SpeedChoiceDropdown", {
     Text     = "Target Game Speed",
     Callback = function(Value)
         local clean = cleanStr(Value)
-        S.speedChoice = speedMap[clean] or 2
+        local parsed = speedMap[clean] or tonumber(clean:match("([%d%.]+)"), 10)
+        if parsed == 1 or parsed == 1.5 or parsed == 2 then
+            S.speedChoice = parsed
+        else
+            S.speedChoice = 2
+        end
         speedRejectedInMatch = false
+        matchFallbackSpeed   = nil
         speedFailCount       = 0
         lastSpeedAttemptTime = 0
         saveS()
+        if Toggles.AutoSpeedToggle and Toggles.AutoSpeedToggle.Value == true and MatchEngineReady then
+            applyDesiredGameSpeed(true)
+        end
     end
 })
 
@@ -2163,7 +2397,7 @@ Library:OnUnload(function()
 end)
 
 -- ==================== 8. PRELOAD PROFILE & ENGINE LINKER + SUPERVISOR ====================
-addLog("Initializing Camera TD Engine (v5.9 Obsidian)...")
+addLog("Initializing Camera TD Engine (v6.0 Obsidian)...")
 pcall(function() loadMacroByName(S.macroName) end)
 updateMacroTimelineUI()
 
@@ -2179,31 +2413,29 @@ task.spawn(function()
                 task.spawn(loadDynamicTowerConfigs)
             end
 
-            if not MatchEngineReady then
-                local ml  = RS:FindFirstChild("ModuleLoader")
-                local sh  = ml and ml:FindFirstChild("Shared")
-                local net = sh and sh:FindFirstChild("Network")
-                local re  = net and net:FindFirstChild("RemoteEvent")
-                local rf  = net and net:FindFirstChild("RemoteFunction")
+            local ml  = RS:FindFirstChild("ModuleLoader")
+            local sh  = ml and ml:FindFirstChild("Shared")
+            local net = sh and sh:FindFirstChild("Network")
+            local re  = net and net:FindFirstChild("RemoteEvent")
+            local rf  = net and net:FindFirstChild("RemoteFunction")
 
-                if re and rf then
-                    Remotes.TowerAdd     = re:FindFirstChild("TowerAdd")
-                    Remotes.TowerUpgrade = re:FindFirstChild("TowerUpgrade")
-                    Remotes.TowerSell    = re:FindFirstChild("TowerSell")
-                    Remotes.TowerTarget  = re:FindFirstChild("TowerTarget")
-                    Remotes.TowerRemove  = re:FindFirstChild("TowerRemove")
-                    Remotes.ModeVote     = re:FindFirstChild("ModeVote")
-                    Remotes.WaveSkip     = re:FindFirstChild("WaveSkip")
-                    Remotes.PlayAgain    = re:FindFirstChild("PlayAgain")
-                    Remotes.OnLeave      = re:FindFirstChild("OnLeave")
-                    Remotes.ChangeSpeed  = rf:FindFirstChild("ChangeSpeed")
+            if re and rf then
+                Remotes.TowerAdd     = Remotes.TowerAdd     or re:FindFirstChild("TowerAdd")
+                Remotes.TowerUpgrade = Remotes.TowerUpgrade or re:FindFirstChild("TowerUpgrade")
+                Remotes.TowerSell    = Remotes.TowerSell    or re:FindFirstChild("TowerSell")
+                Remotes.TowerTarget  = Remotes.TowerTarget  or re:FindFirstChild("TowerTarget")
+                Remotes.TowerRemove  = Remotes.TowerRemove  or re:FindFirstChild("TowerRemove")
+                Remotes.ModeVote     = Remotes.ModeVote     or re:FindFirstChild("ModeVote")
+                Remotes.WaveSkip     = Remotes.WaveSkip     or re:FindFirstChild("WaveSkip")
+                Remotes.PlayAgain    = Remotes.PlayAgain    or re:FindFirstChild("PlayAgain")
+                Remotes.OnLeave      = Remotes.OnLeave      or re:FindFirstChild("OnLeave")
+                Remotes.ChangeSpeed  = Remotes.ChangeSpeed  or rf:FindFirstChild("ChangeSpeed") or getNetworkRemote("ChangeSpeed")
 
-                    if Remotes.TowerAdd and Remotes.TowerUpgrade then
-                        bindMatchRemoteListeners()
-                        if S.disableVFX then applyVFXSetting(true) end
-                        MatchEngineReady = true
-                        addLog("✅ Match Remotes & Tower Configs Linked!")
-                    end
+                if not MatchEngineReady and Remotes.TowerAdd and Remotes.TowerUpgrade then
+                    bindMatchRemoteListeners()
+                    if S.disableVFX then applyVFXSetting(true) end
+                    MatchEngineReady = true
+                    addLog("✅ Match Remotes & Tower Configs Linked!")
                 end
             end
         end)
@@ -2238,84 +2470,33 @@ task.spawn(function()
             end
 
             if MatchEngineReady then
-                -- 1. Non-blocking Smart Game Speed Enforcer (resilient to BUSY/RATE_LIMIT)
+                -- 1. Non-blocking Smart Game Speed Enforcer
                 local autoSpeedOn = (Toggles.AutoSpeedToggle and Toggles.AutoSpeedToggle.Value == true)
-                if autoSpeedOn and isPlaying and Remotes.ChangeSpeed and not speedRejectedInMatch and not isSettingSpeed then
-                    local dropVal     = Options.SpeedChoiceDropdown and cleanStr(Options.SpeedChoiceDropdown.Value)
-                    local targetSpeed = (dropVal and speedMap[dropVal]) or tonumber(S.speedChoice) or 2
-                    local curSpeed    = tonumber(workspace:GetAttribute("GameSpeed")) or 1
-
-                    if math.abs(curSpeed - targetSpeed) > 0.01 then
-                        if tick() - lastSpeedAttemptTime >= 1.5 then
-                            lastSpeedAttemptTime = tick()
-                            isSettingSpeed = true
-                            task.spawn(function()
-                                local ok, res, errCode = pcall(function()
-                                    return Remotes.ChangeSpeed:InvokeServer(targetSpeed)
-                                end)
-                                local waitUntil = tick() + 0.8
-                                while tick() < waitUntil and Controller.Running do
-                                    local liveSpeed = tonumber(workspace:GetAttribute("GameSpeed")) or 1
-                                    if math.abs(liveSpeed - targetSpeed) <= 0.01 then
-                                        break
-                                    end
-                                    task.wait(0.05)
-                                end
-                                local afterSpeed = tonumber(workspace:GetAttribute("GameSpeed")) or 1
-                                if math.abs(afterSpeed - targetSpeed) <= 0.01 or res == true then
-                                    speedFailCount = 0
-                                    addLog("⚡ Game Speed set to " .. tostring(targetSpeed) .. "x")
-                                else
-                                    local codeStr = tostring(errCode or "")
-                                    local isTransient = (not ok)
-                                        or codeStr == "BUSY"
-                                        or codeStr == "RATE_LIMIT"
-                                        or codeStr == "SERVER_BUSY"
-                                        or codeStr == "NO_SESSION"
-                                    if isTransient then
-                                        speedFailCount = 0
-                                    else
-                                        speedFailCount += 1
-                                        if speedFailCount >= 3 then
-                                            if targetSpeed == 2 then
-                                                addLog("2x Speed locked on this account; switching to 1.5x Speed.")
-                                                S.speedChoice = 1.5
-                                                saveS()
-                                                if Options.SpeedChoiceDropdown then
-                                                    pcall(function() Options.SpeedChoiceDropdown:SetValue("1.5x Speed") end)
-                                                end
-                                                speedFailCount = 0
-                                            else
-                                                speedRejectedInMatch = true
-                                                addLog("Speed " .. tostring(targetSpeed) .. "x locked on this account; stopped speed requests.")
-                                            end
-                                        end
-                                    end
-                                end
-                                isSettingSpeed = false
-                            end)
-                        end
-                    else
-                        speedFailCount = 0
-                    end
+                if autoSpeedOn and isPlaying and not speedRejectedInMatch then
+                    applyDesiredGameSpeed(false)
                 end
 
                 -- 2. Gamemode Auto-Vote
                 local autoVoteOn = (Toggles.AutoVoteModeToggle and Toggles.AutoVoteModeToggle.Value == true)
-                if autoVoteOn and isVoting and Remotes.ModeVote and (tick() - lastModeVoteAttempt >= 1.0) then
-                    local modeClean = cleanStr((Options.VoteModeDropdown and Options.VoteModeDropdown.Value) or S.selectedMode)
-                    local votersRaw = workspace:GetAttribute(modeClean .. "Voters")
-                    local alreadyVoted = false
-                    if votersRaw and votersRaw ~= "" then
-                        local ok, voters = pcall(function() return HttpService:JSONDecode(votersRaw) end)
-                        if ok and type(voters) == "table" and table.find(voters, LP.UserId) then
-                            alreadyVoted = true
-                        end
+                if autoVoteOn and isVoting and (tick() - lastModeVoteAttempt >= 1.0) then
+                    if not Remotes.ModeVote or not Remotes.ModeVote.Parent then
+                        Remotes.ModeVote = getNetworkRemote("ModeVote")
                     end
-                    if not alreadyVoted then
-                        lastModeVoteAttempt = tick()
-                        pcall(function() Remotes.ModeVote:FireServer(modeClean) end)
-                        addLog("🗳️ Voted Mode: " .. modeClean)
+                    if Remotes.ModeVote then
+                        local modeClean = cleanStr((Options.VoteModeDropdown and Options.VoteModeDropdown.Value) or S.selectedMode)
+                        local votersRaw = workspace:GetAttribute(modeClean .. "Voters")
+                        local alreadyVoted = false
+                        if votersRaw and votersRaw ~= "" then
+                            local ok, voters = pcall(function() return HttpService:JSONDecode(votersRaw) end)
+                            if ok and type(voters) == "table" and table.find(voters, LP.UserId) then
+                                alreadyVoted = true
+                            end
+                        end
+                        if not alreadyVoted then
+                            lastModeVoteAttempt = tick()
+                            pcall(function() Remotes.ModeVote:FireServer(modeClean) end)
+                            addLog("🗳️ Voted Mode: " .. modeClean)
+                        end
                     end
                 end
 
@@ -2328,14 +2509,18 @@ task.spawn(function()
                         autoFlushRecordingToDisk()
                     end
                     speedRejectedInMatch = false
+                    matchFallbackSpeed   = nil
                     speedFailCount       = 0
                     lastSpeedAttemptTime = 0
                     if S.autoExecute and ENV.__CAM_TD_TP_ARMED ~= true then
                         armAutoExecute(false)
                     end
                     local autoReplayOn = (Toggles.AutoReplayToggle and Toggles.AutoReplayToggle.Value == true)
-                    if autoReplayOn and Remotes.PlayAgain and not hasVotedPlayAgain() then
-                        if tick() - lastPlayAgainAttempt >= 1.0 then
+                    if autoReplayOn and not hasVotedPlayAgain() then
+                        if not Remotes.PlayAgain or not Remotes.PlayAgain.Parent then
+                            Remotes.PlayAgain = getNetworkRemote("PlayAgain")
+                        end
+                        if Remotes.PlayAgain and (tick() - lastPlayAgainAttempt >= 1.0) then
                             lastPlayAgainAttempt = tick()
                             pcall(function() Remotes.PlayAgain:FireServer() end)
                             addLog("⚡ [AutoReplay] Sent PlayAgain Vote!")
@@ -2380,8 +2565,9 @@ task.spawn(function()
                 end
 
                 if not isPlaying or curWave == 0 then
-                    S.macroPlayed = false
+                    S.macroPlayed        = false
                     speedRejectedInMatch = false
+                    matchFallbackSpeed   = nil
                     speedFailCount       = 0
                 end
             end
@@ -2419,4 +2605,4 @@ task.spawn(function()
     end
 end)
 
-notify("Camera TD v5.9 Loaded", "In-Game Match Mode Active!", 4)
+notify("Camera TD v6.0 Loaded", "In-Game Match Mode Active!", 4)
