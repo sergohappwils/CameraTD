@@ -1,15 +1,14 @@
 -- ============================================================================
 -- CAMERA TD // MATCH STUDIO MODULE (Match.lua v5.8)
 -- Fixes:
---   1. Added Lobby & Auto-TP Control inside In-Game Auto tab (can disable
---      Auto Teleport & Start from inside a match + Return to Lobby button)
---   2. Pre-yield Singleton Guard + Obsidian ScreenGui cleanup
---   3. Removed hookmetamethod(__namecall) (reads UnitId directly from
---      TowerAdd.OnClientEvent, eliminating Anticheat hookDetections vector)
---   4. Ownership check in findPlacedTowerModelByPos (co-op safe)
---   5. RemoteSecurity delay pacing (0.24s place, 0.20s upg/sell/target,
---      1.0s ModeVote, 0.75s WaveSkip) + sell/target coordinate fallback
---   6. Responsive mobile viewport sizing + Obsidian disk cache fallback
+--   1. Complete single-file build (no split/EOF syntax errors)
+--   2. Safe mid-match & mid-replay resume (HomePos matching, live Level &
+--      TargetMode checks, sold early-unit detection, fast 0.25s remote linking)
+--   3. Lobby & Auto-TP Control inside In-Game Auto tab (can disable Auto TP
+--      from inside a match + double-click Return To Lobby)
+--   4. Pre-yield Singleton Guard + Obsidian ScreenGui cleanup
+--   5. Removed hookmetamethod (reads UnitId from TowerAdd.OnClientEvent)
+--   6. Co-op ownership filter + RemoteSecurity delay pacing + Mobile sizing
 -- ============================================================================
 
 if not game:IsLoaded() then
@@ -332,7 +331,6 @@ local function saveS()
     end)
 end
 
--- Forward-declared flush hook for Controller.Unload
 local flushRecordingFn = nil
 
 function Controller.Unload()
@@ -811,34 +809,50 @@ local ActiveTowerLevels        = {}
 local ActiveTowerModes         = {}
 local suppressDropdownCallback = false
 
+local function getReplicatorTowerEntry(tId)
+    local entry = nil
+    pcall(function()
+        local rep = shared and shared.Modules and shared.Modules.GameReplicator
+        local towers = rep and rep.Data and rep.Data.Towers
+        if type(towers) == "table" then
+            entry = towers[tId] or towers[tonumber(tId, 10)]
+        end
+    end)
+    return type(entry) == "table" and entry or nil
+end
+
 local function isMyTower(tId)
     if not tId then return false end
     tId = tostring(tId)
     if MyOwnedTowerIds[tId] then return true end
 
-    local isMine = nil
-    pcall(function()
-        local rep = shared and shared.Modules and shared.Modules.GameReplicator
-        local towers = rep and rep.Data and rep.Data.Towers
-        if type(towers) == "table" then
-            local entry = towers[tId] or towers[tonumber(tId, 10)]
-            if type(entry) == "table" then
-                if entry.OwnerUserId == LP.UserId or entry.OwnerName == LP.Name then
-                    MyOwnedTowerIds[tId] = true
-                    isMine = true
-                else
-                    isMine = false
-                end
-            elseif next(towers) == nil then
-                isMine = true
+    local entry = getReplicatorTowerEntry(tId)
+    if entry then
+        if entry.OwnerUserId ~= nil or entry.OwnerName ~= nil then
+            if entry.OwnerUserId == LP.UserId or entry.OwnerName == LP.Name then
+                MyOwnedTowerIds[tId] = true
+                return true
             end
+            return false
         end
-    end)
-
-    if isMine ~= nil then
-        return isMine
+        return true
     end
-    return next(MyOwnedTowerIds) == nil
+    return true
+end
+
+local function getTowerAnchorPos(tId, model)
+    local entry = getReplicatorTowerEntry(tId)
+    if entry then
+        if typeof(entry.HomePos) == "Vector3" then
+            return entry.HomePos
+        elseif typeof(entry.HomeCFrame) == "CFrame" then
+            return entry.HomeCFrame.Position
+        end
+    end
+    if model then
+        return model:GetPivot().Position
+    end
+    return nil
 end
 
 local function getLiveTowerLevel(tId)
@@ -846,15 +860,11 @@ local function getLiveTowerLevel(tId)
     tId = tostring(tId)
     local bestLvl = ActiveTowerLevels[tId] or 1
 
-    pcall(function()
-        if shared and shared.Modules and shared.Modules.GameReplicator and shared.Modules.GameReplicator.Data and shared.Modules.GameReplicator.Data.Towers then
-            local entry = shared.Modules.GameReplicator.Data.Towers[tId] or shared.Modules.GameReplicator.Data.Towers[tonumber(tId, 10)]
-            if entry and tonumber(entry.Level) and tonumber(entry.Level) > bestLvl then
-                bestLvl = tonumber(entry.Level)
-                ActiveTowerLevels[tId] = bestLvl
-            end
-        end
-    end)
+    local entry = getReplicatorTowerEntry(tId)
+    if entry and tonumber(entry.Level) and tonumber(entry.Level) > bestLvl then
+        bestLvl = tonumber(entry.Level)
+        ActiveTowerLevels[tId] = bestLvl
+    end
 
     pcall(function()
         if not towersFolder then
@@ -874,6 +884,17 @@ local function getLiveTowerLevel(tId)
     end)
 
     return bestLvl
+end
+
+local function getLiveTowerTargetMode(tId)
+    if not tId then return nil end
+    tId = tostring(tId)
+    local entry = getReplicatorTowerEntry(tId)
+    if entry and entry.TargetMode then
+        ActiveTowerModes[tId] = tostring(entry.TargetMode)
+        return ActiveTowerModes[tId]
+    end
+    return ActiveTowerModes[tId]
 end
 
 local function updateMacroTimelineUI()
@@ -1023,8 +1044,8 @@ local function bindMatchRemoteListeners()
 
                 MyOwnedTowerIds[tId] = true
                 local tName = tostring(data.Name or "Tower")
-                local pos   = data.Pos
-                local rawCf = data.CFrame or CFrame.new(pos)
+                local pos   = data.HomePos or data.Pos
+                local rawCf = data.HomeCFrame or data.CFrame or CFrame.new(pos)
                 local _, yawRad, _ = rawCf:ToOrientation()
                 local cf    = CFrame.new(pos) * CFrame.Angles(0, yawRad, 0)
 
@@ -1177,10 +1198,13 @@ local function findPlacedTowerModelByPos(targetPos, maxDist, excludeUsed)
     for _, child in ipairs(towersFolder:GetChildren()) do
         if child:IsA("Model") and not child.Name:match("^CinemamanHeadModules_") and isMyTower(child.Name) then
             if not (excludeUsed and UsedTowerIds[child.Name]) then
-                local dist = getDistanceXZ(child:GetPivot().Position, targetPos)
-                if dist < closestDist then
-                    closestDist = dist
-                    closestModel = child
+                local anchor = getTowerAnchorPos(child.Name, child)
+                if anchor then
+                    local dist = getDistanceXZ(anchor, targetPos)
+                    if dist < closestDist then
+                        closestDist = dist
+                        closestModel = child
+                    end
                 end
             end
         end
@@ -1263,7 +1287,25 @@ local function executeReplay(macroData)
     S.totalSteps       = #macroData.actions
     S.currentStepIndex = 0
 
-    addLog(string.format("▶ REPLAY STARTED: %s (%d Steps)", macroData.name or S.macroName, #macroData.actions))
+    -- Mid-match resume detection: identify already-present towers & sold early units
+    local soldAtStep = {}
+    local highestPresentStep = 0
+    for idx, act in ipairs(macroData.actions) do
+        if act.type == "sell" and act.placementIndex then
+            soldAtStep[act.placementIndex] = idx
+        elseif act.type == "place" and act.pos then
+            local p = Vector3.new(act.pos[1], act.pos[2], act.pos[3])
+            if findPlacedTowerModelByPos(p, 2.8, false) then
+                highestPresentStep = idx
+            end
+        end
+    end
+
+    addLog(string.format("▶ REPLAY STARTED: %s (%d Steps%s)",
+        macroData.name or S.macroName,
+        #macroData.actions,
+        highestPresentStep > 0 and (" | Resuming past step #" .. tostring(highestPresentStep)) or ""
+    ))
 
     for i, a in ipairs(macroData.actions) do
         if not S.replaying or not Controller.Running or not isMatchActive() then
@@ -1289,6 +1331,21 @@ local function executeReplay(macroData)
         safeCall("ReplayStep_" .. tostring(i), function()
             if a.type == "place" then
                 local targetPos = Vector3.new(a.pos[1], a.pos[2], a.pos[3])
+                local existing = findPlacedTowerModelByPos(targetPos, 2.6, true)
+                if existing then
+                    ReplayTowers[a.placementIndex]   = existing.Name
+                    UsedTowerIds[existing.Name]      = a.placementIndex
+                    ActiveTowerLevels[existing.Name] = getLiveTowerLevel(existing.Name)
+                    getLiveTowerTargetMode(existing.Name)
+                    return
+                end
+
+                -- If re-executing mid-game after this unit was already placed & sold, skip re-buying it
+                local sStep = soldAtStep[a.placementIndex]
+                if sStep and sStep < highestPresentStep then
+                    return
+                end
+
                 local yawRad = 0
                 if a.cframe and #a.cframe == 12 then
                     local okCf, parsedCf = pcall(function() return CFrame.new(table.unpack(a.cframe)) end)
@@ -1298,14 +1355,6 @@ local function executeReplay(macroData)
                     end
                 end
                 local cf = CFrame.new(targetPos) * CFrame.Angles(0, yawRad, 0)
-
-                local existing = findPlacedTowerModelByPos(targetPos, 1.8, true)
-                if existing then
-                    ReplayTowers[a.placementIndex]   = existing.Name
-                    UsedTowerIds[existing.Name]      = a.placementIndex
-                    ActiveTowerLevels[existing.Name] = getLiveTowerLevel(existing.Name)
-                    return
-                end
 
                 local cost   = getTowerPlacementCost(a.towerName, a.cost)
                 local status = awaitCashAndPause(cost, "Place " .. a.towerName)
@@ -1394,31 +1443,49 @@ local function executeReplay(macroData)
                 task.wait(0.20)
 
             elseif a.type == "sell" then
+                local tId = resolveTowerIdForAction(a, macroData)
+                if not tId then return end
                 local status = awaitCashAndPause(0, "Sell #" .. tostring(a.placementIndex))
                 if status == "ABORT" then S.replaying = false return end
-                if status ~= "SKIP" then
-                    local tId = resolveTowerIdForAction(a, macroData)
-                    if tId and Remotes.TowerSell then
-                        pcall(function() Remotes.TowerSell:FireServer({ Id = tId }) end)
-                        ReplayTowers[a.placementIndex] = nil
-                        UsedTowerIds[tId]              = nil
-                        ActiveTowerLevels[tId]         = nil
-                        ActiveTowerModes[tId]          = nil
-                        MyOwnedTowerIds[tId]           = nil
-                        addLog(string.format("Sold Unit #%d", a.placementIndex))
-                    end
+                if status ~= "SKIP" and Remotes.TowerSell then
+                    pcall(function() Remotes.TowerSell:FireServer({ Id = tId }) end)
+                    ReplayTowers[a.placementIndex] = nil
+                    UsedTowerIds[tId]              = nil
+                    ActiveTowerLevels[tId]         = nil
+                    ActiveTowerModes[tId]          = nil
+                    MyOwnedTowerIds[tId]           = nil
+                    addLog(string.format("Sold Unit #%d", a.placementIndex))
                 end
                 task.wait(0.20)
 
             elseif a.type == "target" then
+                local tId = resolveTowerIdForAction(a, macroData)
+                if not tId or not Remotes.TowerTarget then return end
+                local desiredMode = a.targetMode
+                local liveMode = getLiveTowerTargetMode(tId)
+                if liveMode and desiredMode and liveMode == desiredMode then
+                    return
+                end
+                -- If consecutive target steps exist for this tower and it is already at the final mode of that burst, skip
+                if liveMode then
+                    local burstFinal = desiredMode
+                    for k = i + 1, #macroData.actions do
+                        local nxt = macroData.actions[k]
+                        if nxt.type == "target" and nxt.placementIndex == a.placementIndex then
+                            burstFinal = nxt.targetMode
+                        else
+                            break
+                        end
+                    end
+                    if liveMode == burstFinal then
+                        return
+                    end
+                end
                 local status = awaitCashAndPause(0, "Target #" .. tostring(a.placementIndex))
                 if status == "ABORT" then S.replaying = false return end
                 if status ~= "SKIP" then
-                    local tId = resolveTowerIdForAction(a, macroData)
-                    if tId and Remotes.TowerTarget then
-                        pcall(function() Remotes.TowerTarget:FireServer({ Id = tId }) end)
-                        addLog(string.format("Target Mode #%d -> %s", a.placementIndex, tostring(a.targetMode)))
-                    end
+                    pcall(function() Remotes.TowerTarget:FireServer({ Id = tId }) end)
+                    addLog(string.format("Target Mode #%d -> %s", a.placementIndex, tostring(a.targetMode)))
                 end
                 task.wait(0.20)
             end
@@ -2072,12 +2139,12 @@ Library:OnUnload(function()
     Controller.Unload()
 end)
 
--- ==================== 8. ENGINE LINKER & SUPERVISOR LOOP ====================
-task.spawn(function()
-    addLog("Initializing Camera TD Engine (v5.8 Obsidian)...")
-    pcall(function() loadMacroByName(S.macroName) end)
-    updateMacroTimelineUI()
+-- ==================== 8. PRELOAD PROFILE & ENGINE LINKER + SUPERVISOR ====================
+addLog("Initializing Camera TD Engine (v5.8 Obsidian)...")
+pcall(function() loadMacroByName(S.macroName) end)
+updateMacroTimelineUI()
 
+task.spawn(function()
     while Controller.Running do
         safeCall("EngineLinker", function()
             playerGui    = LP:FindFirstChildOfClass("PlayerGui")
@@ -2118,7 +2185,7 @@ task.spawn(function()
             end
         end)
 
-        task.wait(1.5)
+        task.wait(MatchEngineReady and 1.5 or 0.25)
     end
 end)
 
@@ -2248,7 +2315,7 @@ task.spawn(function()
                     addLog("⏹ Replay Reset: Match transitioned to Voting/Lobby.")
                 end
 
-                -- 6. AutoPlay Trigger on Wave >= 1
+                -- 6. AutoPlay Trigger on Wave >= 1 (works on Wave 1 OR mid-match re-exec)
                 local autoPlayOn = (Toggles.AutoPlayMacroToggle and Toggles.AutoPlayMacroToggle.Value == true)
                 if autoPlayOn and isPlaying and curWave >= 1 and not S.replaying and not S.recording and not S.macroPlayed then
                     S.macroPlayed = true
@@ -2311,4 +2378,3 @@ task.spawn(function()
 end)
 
 notify("Camera TD v5.8 Loaded", "In-Game Match Mode Active!", 4)
-local function isMyTower
