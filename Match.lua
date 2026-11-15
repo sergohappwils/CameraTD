@@ -1,71 +1,126 @@
 -- ============================================================================
--- CAMERA TD // MATCH STUDIO MODULE (Match.lua v5.7)
+-- CAMERA TD // MATCH STUDIO MODULE (Match.lua v5.8)
 -- Fixes:
---   1. Fixed tonumber(str:gsub(...)) 2nd return value bug ('base out of range')
---      that crashed Upgrade Recording & ReplayStep!
---   2. Wrapped all MacroFileSelect:SetValues / :SetValue with suppressDropdownCallback
---   3. Added `if suppressDropdownCallback or S.recording then return end` guard
---   4. Dynamic Game Config Prices + Persistent Godly ($27k) Upgrade Loop
+--   1. Added Lobby & Auto-TP Control inside In-Game Auto tab (can disable
+--      Auto Teleport & Start from inside a match + Return to Lobby button)
+--   2. Pre-yield Singleton Guard + Obsidian ScreenGui cleanup
+--   3. Removed hookmetamethod(__namecall) (reads UnitId directly from
+--      TowerAdd.OnClientEvent, eliminating Anticheat hookDetections vector)
+--   4. Ownership check in findPlacedTowerModelByPos (co-op safe)
+--   5. RemoteSecurity delay pacing (0.24s place, 0.20s upg/sell/target,
+--      1.0s ModeVote, 0.75s WaveSkip) + sell/target coordinate fallback
+--   6. Responsive mobile viewport sizing + Obsidian disk cache fallback
 -- ============================================================================
 
 if not game:IsLoaded() then
     game.Loaded:Wait()
 end
 
-local GITHUB_LOADER_URL = "https://raw.githubusercontent.com/sergohappwils/CameraTD/refs/heads/main/Macro"
-local OBSIDIAN_REPO     = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main/"
-local FOLDER            = "CameraTD_Macro"
-local DELAY_FILE        = FOLDER .. "/startup_delay.txt"
-local CACHE_DIR         = FOLDER .. "/cache"
-local LOADER_CACHE      = CACHE_DIR .. "/loader_cache.luau"
+local GITHUB_LOADER_URL  = "https://raw.githubusercontent.com/sergohappwils/CameraTD/refs/heads/main/Macro"
+local OBSIDIAN_REPO      = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main/"
+local FOLDER             = "CameraTD_Macro"
+local DELAY_FILE         = FOLDER .. "/startup_delay.txt"
+local CACHE_DIR          = FOLDER .. "/cache"
+local LOADER_CACHE       = CACHE_DIR .. "/loader_cache.luau"
+local OBSIDIAN_LIB_CACHE = CACHE_DIR .. "/obsidian_library.luau"
+local OBSIDIAN_THM_CACHE = CACHE_DIR .. "/obsidian_theme.luau"
+local OBSIDIAN_SAV_CACHE = CACHE_DIR .. "/obsidian_save.luau"
 
--- ==================== 1. SINGLETON & LEGACY UI CLEANUP GUARD ====================
-local ENV = (getgenv and getgenv()) or _G
-if ENV.__CAM_TD_CONTROLLER then
-    pcall(function()
-        ENV.__CAM_TD_CONTROLLER.Unload()
-    end)
-    task.wait(0.2)
-end
-
-local function destroyLegacyUI()
-    pcall(function()
-        if gethui then
-            local h = gethui()
-            local old = h and h:FindFirstChild("CameraTD_PrecisionV47")
-            if old then old:Destroy() end
-        end
-        local core = game:GetService("CoreGui")
-        local oldCore = core and core:FindFirstChild("CameraTD_PrecisionV47")
-        if oldCore then oldCore:Destroy() end
-        local lp = game:GetService("Players").LocalPlayer
-        local pg = lp and lp:FindFirstChildOfClass("PlayerGui")
-        local oldPg = pg and pg:FindFirstChild("CameraTD_PrecisionV47")
-        if oldPg then oldPg:Destroy() end
-    end)
-end
-destroyLegacyUI()
-
-local Controller = { Running = true, Connections = {}, Unloaded = false }
-ENV.__CAM_TD_CONTROLLER = Controller
-_G.__CAM_TD_MACRO = true
-
-local function trackConn(conn)
-    if conn then
-        table.insert(Controller.Connections, conn)
-    end
-    return conn
-end
-
--- ==================== 2. SERVICES & SAFE PARSING HELPERS ====================
-local Players     = game:GetService("Players")
-local RS          = game:GetService("ReplicatedStorage")
-local HttpService = game:GetService("HttpService")
-local VirtualUser = nil
+local Players          = game:GetService("Players")
+local RS               = game:GetService("ReplicatedStorage")
+local HttpService      = game:GetService("HttpService")
+local UserInputService = game:GetService("UserInputService")
+local VirtualUser      = nil
 pcall(function() VirtualUser = game:GetService("VirtualUser") end)
 
 local LP = Players.LocalPlayer or Players.PlayerAdded:Wait()
 
+-- ==================== 1. HARD SINGLETON & UI CLEANUP GUARD ====================
+local ENV = (getgenv and getgenv()) or _G
+local myExecSeq = (ENV.__CAM_TD_EXEC_SEQ or 0) + 1
+ENV.__CAM_TD_EXEC_SEQ = myExecSeq
+
+local function getGuiContainers()
+    local list = {}
+    if gethui then
+        local ok, h = pcall(gethui)
+        if ok and typeof(h) == "Instance" then
+            table.insert(list, h)
+        end
+    end
+    pcall(function()
+        local cg = game:GetService("CoreGui")
+        if cg then table.insert(list, cg) end
+    end)
+    local pg = LP and LP:FindFirstChildOfClass("PlayerGui")
+    if pg then
+        table.insert(list, pg)
+    end
+    return list
+end
+
+local function isCameraTdScreenGui(gui)
+    if not gui or not gui:IsA("ScreenGui") then return false end
+    if gui.Name == "CameraTD_PrecisionV47" or gui:GetAttribute("__CAM_TD_UI") == true then
+        return true
+    end
+    if gui.Name == "Obsidian" then
+        for _, desc in ipairs(gui:GetDescendants()) do
+            if desc:IsA("TextLabel") and type(desc.Text) == "string" and desc.Text:find("CAMERA TD //", 1, true) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+local function destroyLegacyUI()
+    pcall(function()
+        if ENV.__CAM_TD_OBSIDIAN_LIB and type(ENV.__CAM_TD_OBSIDIAN_LIB.Unload) == "function" then
+            pcall(function() ENV.__CAM_TD_OBSIDIAN_LIB:Unload() end)
+        end
+        ENV.__CAM_TD_OBSIDIAN_LIB = nil
+
+        if type(ENV.__CAM_TD_ACTIVE_GUIS) == "table" then
+            for _, g in ipairs(ENV.__CAM_TD_ACTIVE_GUIS) do
+                pcall(function()
+                    if typeof(g) == "Instance" and g.Parent then
+                        g:Destroy()
+                    end
+                end)
+            end
+        end
+        ENV.__CAM_TD_ACTIVE_GUIS = {}
+
+        for _, container in ipairs(getGuiContainers()) do
+            for _, child in ipairs(container:GetChildren()) do
+                if isCameraTdScreenGui(child) then
+                    pcall(function() child:Destroy() end)
+                end
+            end
+        end
+    end)
+end
+
+if ENV.__CAM_TD_CONTROLLER then
+    pcall(function()
+        if type(ENV.__CAM_TD_CONTROLLER.Unload) == "function" then
+            ENV.__CAM_TD_CONTROLLER.Unload()
+        end
+    end)
+end
+destroyLegacyUI()
+task.wait(0.05)
+
+if ENV.__CAM_TD_EXEC_SEQ ~= myExecSeq then
+    return
+end
+
+local Controller = { Running = true, Connections = {}, Unloaded = false, UIs = {} }
+local Library, ThemeManager, SaveManager = nil, nil, nil
+_G.__CAM_TD_MACRO = true
+
+-- ==================== 2. FILESYSTEM & PARSING HELPERS ====================
 local MACRO_FOLDER     = FOLDER .. "/macros"
 local SETTINGS_FILE    = FOLDER .. "/" .. LP.Name .. "_settings.json"
 local SHARED_SKIP_FILE = FOLDER .. "/shared_skip_waves.txt"
@@ -91,7 +146,6 @@ local function cleanStr(val)
     return val:gsub("^<%s*", ""):gsub("%s*>$", ""):match("^%s*(.-)%s*$") or ""
 end
 
--- Safe base-10 integer parser (discards 2nd return value of gsub so tonumber never errors with 'base out of range')
 local function parseDigits(val)
     if type(val) == "number" then return val end
     if type(val) ~= "string" then return nil end
@@ -148,7 +202,6 @@ local function safeCall(context, fn, ...)
     return true, res
 end
 
--- ==================== 3. FILESYSTEM & PERSISTENT SETTINGS ====================
 local function saveJSON(path, data)
     local ok = false
     pcall(function()
@@ -200,7 +253,7 @@ pcall(function()
 end)
 
 local DEFAULTS = {
-    -- Lobby Settings
+    -- Lobby Settings (Synced with Lobby.lua)
     autoJoinMatch       = false,
     selectedMap         = "Toilet City",
     joinMethod          = "Teleport",
@@ -249,7 +302,6 @@ pcall(function()
     end
 end)
 
--- Runtime state (non-saved)
 S.recording        = false
 S.replaying        = false
 S.paused           = false
@@ -260,6 +312,8 @@ S.currentStepIndex = 0
 S.totalSteps       = 0
 S.currentStepText  = "Idle"
 S.teleportQueued   = ENV.__CAM_TD_TP_ARMED == true
+
+local recData = { version = 5.8, actions = {} }
 
 local function saveS()
     pcall(function()
@@ -277,20 +331,107 @@ local function saveS()
         end
     end)
 end
+
+-- Forward-declared flush hook for Controller.Unload
+local flushRecordingFn = nil
+
+function Controller.Unload()
+    if Controller.Unloaded then return end
+    Controller.Unloaded = true
+    Controller.Running  = false
+    _G.__CAM_TD_MACRO   = false
+    if S.recording and #recData.actions > 0 and flushRecordingFn then
+        pcall(flushRecordingFn)
+    end
+    S.recording = false
+    S.replaying = false
+    saveS()
+    for _, c in ipairs(Controller.Connections) do
+        pcall(function() c:Disconnect() end)
+    end
+    table.clear(Controller.Connections)
+    if Library then
+        pcall(function() Library:Unload() end)
+    end
+    for _, g in ipairs(Controller.UIs) do
+        pcall(function()
+            if typeof(g) == "Instance" and g.Parent then
+                g:Destroy()
+            end
+        end)
+    end
+    table.clear(Controller.UIs)
+    if ENV.__CAM_TD_CONTROLLER == Controller then
+        ENV.__CAM_TD_CONTROLLER = nil
+    end
+end
+
+ENV.__CAM_TD_CONTROLLER = Controller
 saveS()
 
--- ==================== 4. LOAD OBSIDIAN UI LIBRARY ====================
-local Library, ThemeManager, SaveManager
+local function trackConn(conn)
+    if conn then
+        if Controller.Unloaded then
+            pcall(function() conn:Disconnect() end)
+            return conn
+        end
+        table.insert(Controller.Connections, conn)
+    end
+    return conn
+end
+
+-- ==================== 3. LOAD OBSIDIAN UI LIBRARY (WITH CACHE FALLBACK) ====================
+local function fetchModuleWithCache(url, cachePath)
+    local src = nil
+    local ok, res = pcall(function()
+        return game:HttpGet(url)
+    end)
+    if ok and type(res) == "string" and #res > 100 and not res:match("^404:") then
+        src = res
+        pcall(function()
+            if writefile then
+                ensureFolders()
+                writefile(cachePath, src)
+            end
+        end)
+    elseif isfile and readfile then
+        pcall(function()
+            if isfile(cachePath) then
+                src = readfile(cachePath)
+            end
+        end)
+    end
+    if not src then return nil end
+    local fn = loadstring(src)
+    return fn and fn() or nil
+end
+
+local beforeGuis = {}
+for _, container in ipairs(getGuiContainers()) do
+    for _, child in ipairs(container:GetChildren()) do
+        if child:IsA("ScreenGui") then
+            beforeGuis[child] = true
+        end
+    end
+end
+
 safeCall("LoadObsidianLibrary", function()
-    Library      = loadstring(game:HttpGet(OBSIDIAN_REPO .. "Library.lua"))()
-    ThemeManager = loadstring(game:HttpGet(OBSIDIAN_REPO .. "addons/ThemeManager.lua"))()
-    SaveManager  = loadstring(game:HttpGet(OBSIDIAN_REPO .. "addons/SaveManager.lua"))()
+    Library      = fetchModuleWithCache(OBSIDIAN_REPO .. "Library.lua", OBSIDIAN_LIB_CACHE)
+    ThemeManager = fetchModuleWithCache(OBSIDIAN_REPO .. "addons/ThemeManager.lua", OBSIDIAN_THM_CACHE)
+    SaveManager  = fetchModuleWithCache(OBSIDIAN_REPO .. "addons/SaveManager.lua", OBSIDIAN_SAV_CACHE)
 end)
 
-if not Library then
-    warn("[CameraTD] Critical: Could not load Obsidian Library from GitHub.")
+if Controller.Unloaded or ENV.__CAM_TD_EXEC_SEQ ~= myExecSeq then
+    if Library then pcall(function() Library:Unload() end) end
     return
 end
+
+if not Library then
+    warn("[CameraTD] Critical: Could not load Obsidian Library.")
+    return
+end
+
+ENV.__CAM_TD_OBSIDIAN_LIB = Library
 
 local Options = Library.Options
 local Toggles = Library.Toggles
@@ -307,8 +448,17 @@ local function notify(title, desc, duration)
     end)
 end
 
--- ==================== 5. GITHUB + TELEPORT AUTO-EXECUTE ====================
+-- ==================== 4. TELEPORT AUTO-EXECUTE & ANTI-AFK ====================
 local function armAutoExecute(showLog)
+    if ENV.__CAM_TD_TP_ARMED == true then
+        S.teleportQueued = true
+        if showLog then
+            addLog("✅ Auto-Execute is already armed (duplicate blocked).")
+            notify("Auto-Execute", "Already armed for next teleport!", 3)
+        end
+        return true
+    end
+
     local qFunc = queue_on_teleport
         or queueonteleport
         or (syn and syn.queue_on_teleport)
@@ -321,42 +471,39 @@ local function armAutoExecute(showLog)
         return false
     end
 
-    if not S.teleportQueued then
-        local payload = string.format([[
-            if not game:IsLoaded() then game.Loaded:Wait() end
-            local ok, src = pcall(function()
-                return game:HttpGet(%q .. "?t=" .. tostring(os.time()))
-            end)
-            if ok and type(src) == "string" and #src > 60 then
-                if writefile then pcall(writefile, %q, src) end
-                local fn = loadstring(src)
-                if fn then task.spawn(fn) return end
-            end
-            if isfile and readfile and isfile(%q) then
-                local fn = loadstring(readfile(%q))
-                if fn then task.spawn(fn) end
-            end
-        ]], GITHUB_LOADER_URL, LOADER_CACHE, LOADER_CACHE, LOADER_CACHE)
-
-        local ok, err = pcall(qFunc, payload)
-        if ok then
-            S.teleportQueued = true
-            ENV.__CAM_TD_TP_ARMED = true
-            if showLog then
-                addLog("✅ Auto-Execute Armed (GitHub Live + Cache)!")
-                notify("Auto-Execute", "Armed for next teleport!", 3)
-            end
-            return true
-        else
-            if showLog then addLog("❌ Auto-Exec Error: " .. tostring(err), true) end
-            return false
+    local payload = string.format([[
+        local E = (getgenv and getgenv()) or _G
+        local now = os.clock()
+        if E.__CAM_TD_PAYLOAD_LOCK and (now - E.__CAM_TD_PAYLOAD_LOCK) < 4 then return end
+        E.__CAM_TD_PAYLOAD_LOCK = now
+        E.__CAM_TD_FROM_TP = true
+        if not game:IsLoaded() then game.Loaded:Wait() end
+        local ok, src = pcall(function()
+            return game:HttpGet(%q .. "?t=" .. tostring(os.time()))
+        end)
+        if ok and type(src) == "string" and #src > 60 then
+            if writefile then pcall(writefile, %q, src) end
+            local fn = loadstring(src)
+            if fn then task.spawn(fn) return end
         end
-    else
+        if isfile and readfile and isfile(%q) then
+            local fn = loadstring(readfile(%q))
+            if fn then task.spawn(fn) end
+        end
+    ]], GITHUB_LOADER_URL, LOADER_CACHE, LOADER_CACHE, LOADER_CACHE)
+
+    local ok, err = pcall(qFunc, payload)
+    if ok then
+        S.teleportQueued = true
+        ENV.__CAM_TD_TP_ARMED = true
         if showLog then
-            addLog("✅ Auto-Execute is already armed for teleport!")
-            notify("Auto-Execute", "Already armed for teleport!", 3)
+            addLog("✅ Auto-Execute Armed (GitHub Live + Cache)!")
+            notify("Auto-Execute", "Armed for next teleport!", 3)
         end
         return true
+    else
+        if showLog then addLog("❌ Auto-Exec Error: " .. tostring(err), true) end
+        return false
     end
 end
 
@@ -365,7 +512,7 @@ if S.autoExecute then
 end
 
 trackConn(LP.OnTeleport:Connect(function()
-    if S.autoExecute and not S.teleportQueued then
+    if S.autoExecute and ENV.__CAM_TD_TP_ARMED ~= true then
         armAutoExecute(false)
     end
 end))
@@ -398,13 +545,12 @@ applyFPSCap(S.fpsCap)
 
 task.spawn(function()
     while Controller.Running do
-        destroyLegacyUI()
         applyFPSCap(S.fpsCap)
-        task.wait(2.0)
+        task.wait(2.5)
     end
 end)
 
--- ==================== 6. IN-GAME STATE & DYNAMIC CONFIG HELPERS ====================
+-- ==================== 5. IN-GAME STATE & DYNAMIC CONFIG HELPERS ====================
 local playerGui        = LP:FindFirstChildOfClass("PlayerGui")
 local gameUI           = playerGui and playerGui:FindFirstChild("GameUI")
 local gameFolder       = workspace:FindFirstChild("Game")
@@ -415,7 +561,6 @@ local ConfigTowers     = {}
 local Remotes          = {}
 local MatchEngineReady = false
 
--- Dynamically loads Tower Configs from shared.Modules.Config AND ReplicatedStorage.ModuleLoader.Configs.Config.Towers
 local function loadDynamicTowerConfigs()
     pcall(function()
         if shared and shared.Modules and type(shared.Modules.Config) == "table" then
@@ -510,6 +655,8 @@ local function getCash()
 end
 
 local function isGameOver()
+    local gs = workspace:GetAttribute("GameState")
+    if gs == "Won" or gs == "Lost" then return true end
     local msg = workspace:GetAttribute("Message")
     if msg == "You Won!" or msg == "You Lost!" then return true end
     local timer = tonumber(workspace:GetAttribute("PlayAgainTimer"))
@@ -588,7 +735,6 @@ local function getTowerPlacementCost(towerName, recordedCost)
     return 100
 end
 
--- Checks live ConfigTowers[towerName].Upgrades[nextLevel].Price FIRST using safe parseDigits!
 local function getTowerUpgradeCost(towerName, nextLevel, recordedCost)
     local tData = ConfigTowers[towerName]
     if tData and tData.Upgrades and tData.Upgrades[nextLevel] and tData.Upgrades[nextLevel].Price then
@@ -652,21 +798,48 @@ local function resolveUnitIdForTower(towerName, fallbackId)
     return foundId or fallbackId or "1"
 end
 
--- ==================== 7. MACRO RECORDING & REPLAY ENGINE ====================
-local recData                  = { version = 5.7, actions = {} }
+-- ==================== 6. MACRO RECORDING & REPLAY ENGINE ====================
 local TowerIdToPlacementIndex  = {}
 local recordedTowerLevels      = {}
 local recordedSoldTowers       = {}
 local recordedTowerModes       = {}
-local pendingUnitIds           = {}
-local lastPlaceTime            = 0
-local lastPlacePos             = Vector3.zero
+local MyOwnedTowerIds          = {}
 
 local ReplayTowers             = {}
 local UsedTowerIds             = {}
 local ActiveTowerLevels        = {}
 local ActiveTowerModes         = {}
 local suppressDropdownCallback = false
+
+local function isMyTower(tId)
+    if not tId then return false end
+    tId = tostring(tId)
+    if MyOwnedTowerIds[tId] then return true end
+
+    local isMine = nil
+    pcall(function()
+        local rep = shared and shared.Modules and shared.Modules.GameReplicator
+        local towers = rep and rep.Data and rep.Data.Towers
+        if type(towers) == "table" then
+            local entry = towers[tId] or towers[tonumber(tId, 10)]
+            if type(entry) == "table" then
+                if entry.OwnerUserId == LP.UserId or entry.OwnerName == LP.Name then
+                    MyOwnedTowerIds[tId] = true
+                    isMine = true
+                else
+                    isMine = false
+                end
+            elseif next(towers) == nil then
+                isMine = true
+            end
+        end
+    end)
+
+    if isMine ~= nil then
+        return isMine
+    end
+    return next(MyOwnedTowerIds) == nil
+end
 
 local function getLiveTowerLevel(tId)
     if not tId then return 1 end
@@ -752,7 +925,6 @@ local function syncMacroFromRec(name)
     updateMacroTimelineUI()
 end
 
--- Helper that safely updates MacroFileSelect with suppressDropdownCallback = true/false
 local function autoFlushRecordingToDisk()
     if not S.recording or #recData.actions == 0 then return end
     local profName = cleanStr((Options and Options.MacroNameInput and Options.MacroNameInput.Value) or S.macroName or "Farm")
@@ -773,6 +945,7 @@ local function autoFlushRecordingToDisk()
         end
     end
 end
+flushRecordingFn = autoFlushRecordingToDisk
 
 local function saveCurrentMacro(name)
     name = cleanStr(name or (Options and Options.MacroNameInput and Options.MacroNameInput.Value) or S.macroName or "Farm")
@@ -838,49 +1011,17 @@ local function loadMacroByName(name)
     return false
 end
 
-ENV.__CAM_TD_HOOK_CB = function(payload)
-    if not S.recording then return end
-    if type(payload) == "table" and payload.Name then
-        pendingUnitIds[tostring(payload.Name)] = payload.UnitId and tostring(payload.UnitId) or resolveUnitIdForTower(tostring(payload.Name))
-        local now = tick()
-        local pos = payload.Pos or (payload.CFrame and payload.CFrame.Position)
-        if pos then
-            if (now - lastPlaceTime < 0.35) and (getDistanceXZ(lastPlacePos, pos) < 1.0) then return end
-            lastPlaceTime = now
-            lastPlacePos = pos
-        end
-    end
-end
-
-if not ENV.__CAM_TD_NAMECALL_HOOKED and hookmetamethod and getnamecallmethod then
-    ENV.__CAM_TD_NAMECALL_HOOKED = true
-    pcall(function()
-        local wrapClosure = newcclosure or function(f) return f end
-        local isCaller = checkcaller or function() return false end
-        local oldNamecall
-        oldNamecall = hookmetamethod(game, "__namecall", wrapClosure(function(self, ...)
-            local method = getnamecallmethod()
-            if not isCaller() and typeof(self) == "Instance" and (method == "FireServer" or method == "fireServer") then
-                if self.Name == "TowerAdd" and ENV.__CAM_TD_HOOK_CB then
-                    local args = { ... }
-                    task.spawn(function() pcall(ENV.__CAM_TD_HOOK_CB, args[1]) end)
-                end
-            end
-            return oldNamecall(self, ...)
-        end))
-    end)
-end
-
 local function bindMatchRemoteListeners()
     if Remotes.TowerAdd then
         trackConn(Remotes.TowerAdd.OnClientEvent:Connect(function(data)
             safeCall("TowerAddListener", function()
                 local rawId = data and (data.Id or data.Index)
                 if not rawId then return end
+                local tId    = tostring(rawId)
                 local isMine = (data.OwnerUserId == LP.UserId) or (data.OwnerName == LP.Name)
                 if not isMine or not data.Pos then return end
 
-                local tId   = tostring(rawId)
+                MyOwnedTowerIds[tId] = true
                 local tName = tostring(data.Name or "Tower")
                 local pos   = data.Pos
                 local rawCf = data.CFrame or CFrame.new(pos)
@@ -889,7 +1030,7 @@ local function bindMatchRemoteListeners()
 
                 if S.recording and not TowerIdToPlacementIndex[tId] then
                     local newIdx      = #recData.actions + 1
-                    local savedUnitId = pendingUnitIds[tName] or resolveUnitIdForTower(tName, "1")
+                    local savedUnitId = (data.UnitId and tostring(data.UnitId) ~= "" and tostring(data.UnitId)) or resolveUnitIdForTower(tName, "1")
                     local liveCost    = (data.Stats and tonumber(data.Stats.Price)) or getTowerPlacementCost(tName)
                     TowerIdToPlacementIndex[tId] = newIdx
                     recordedTowerLevels[tId]     = 1
@@ -910,6 +1051,15 @@ local function bindMatchRemoteListeners()
                 if S.replaying then
                     ActiveTowerLevels[tId] = 1
                     if S.macro and S.macro.actions and not UsedTowerIds[tId] then
+                        local curAct = S.macro.actions[S.currentStepIndex]
+                        if curAct and curAct.type == "place" and curAct.pos and not ReplayTowers[curAct.placementIndex] then
+                            local curPos = Vector3.new(curAct.pos[1], curAct.pos[2], curAct.pos[3])
+                            if getDistanceXZ(curPos, pos) < 3.5 then
+                                ReplayTowers[curAct.placementIndex] = tId
+                                UsedTowerIds[tId] = curAct.placementIndex
+                                return
+                            end
+                        end
                         for _, act in ipairs(S.macro.actions) do
                             if act.type == "place" and act.pos and not ReplayTowers[act.placementIndex] then
                                 local actPos = Vector3.new(act.pos[1], act.pos[2], act.pos[3])
@@ -973,9 +1123,10 @@ local function bindMatchRemoteListeners()
     if removeEvent then
         trackConn(removeEvent.OnClientEvent:Connect(function(data)
             safeCall("TowerRemoveListener", function()
-                if not S.recording then return end
                 local tId = data and (data.Id and tostring(data.Id) or (data.Index and tostring(data.Index)))
                 if not tId then return end
+                MyOwnedTowerIds[tId] = nil
+                if not S.recording then return end
                 local pIdx = TowerIdToPlacementIndex[tId]
                 if pIdx and not recordedSoldTowers[tId] then
                     recordedSoldTowers[tId] = true
@@ -1024,7 +1175,7 @@ local function findPlacedTowerModelByPos(targetPos, maxDist, excludeUsed)
     local threshold = maxDist or 2.8
     local closestModel, closestDist = nil, 999999
     for _, child in ipairs(towersFolder:GetChildren()) do
-        if child:IsA("Model") and not child.Name:match("^CinemamanHeadModules_") then
+        if child:IsA("Model") and not child.Name:match("^CinemamanHeadModules_") and isMyTower(child.Name) then
             if not (excludeUsed and UsedTowerIds[child.Name]) then
                 local dist = getDistanceXZ(child:GetPivot().Position, targetPos)
                 if dist < closestDist then
@@ -1035,6 +1186,30 @@ local function findPlacedTowerModelByPos(targetPos, maxDist, excludeUsed)
         end
     end
     return (closestDist <= threshold) and closestModel or nil
+end
+
+local function resolveTowerIdForAction(a, macroData)
+    if not towersFolder then
+        gameFolder = workspace:FindFirstChild("Game")
+        towersFolder = gameFolder and gameFolder:FindFirstChild("Towers")
+    end
+    local tId = ReplayTowers[a.placementIndex]
+    local model = tId and towersFolder and towersFolder:FindFirstChild(tId)
+    if model then
+        return tId, model
+    end
+    for _, prevAct in ipairs(macroData.actions) do
+        if prevAct.type == "place" and prevAct.placementIndex == a.placementIndex and prevAct.pos then
+            local found = findPlacedTowerModelByPos(Vector3.new(prevAct.pos[1], prevAct.pos[2], prevAct.pos[3]), 2.8, false)
+            if found then
+                tId = found.Name
+                ReplayTowers[a.placementIndex] = tId
+                UsedTowerIds[tId]              = a.placementIndex
+                return tId, found
+            end
+        end
+    end
+    return nil, nil
 end
 
 local function setMatchStatusText(txt)
@@ -1167,29 +1342,10 @@ local function executeReplay(macroData)
                 else
                     addLog(string.format("Place Failed: %s (#%d)", a.towerName, a.placementIndex), true)
                 end
-                task.wait(0.1)
+                task.wait(0.24)
 
             elseif a.type == "upgrade" then
-                local tId = ReplayTowers[a.placementIndex]
-                if not towersFolder then
-                    gameFolder = workspace:FindFirstChild("Game")
-                    towersFolder = gameFolder and gameFolder:FindFirstChild("Towers")
-                end
-                local model = tId and towersFolder and towersFolder:FindFirstChild(tId)
-                if not model then
-                    for _, prevAct in ipairs(macroData.actions) do
-                        if prevAct.type == "place" and prevAct.placementIndex == a.placementIndex and prevAct.pos then
-                            model = findPlacedTowerModelByPos(Vector3.new(prevAct.pos[1], prevAct.pos[2], prevAct.pos[3]), 2.8, false)
-                            if model then
-                                tId = model.Name
-                                ReplayTowers[a.placementIndex] = tId
-                                UsedTowerIds[tId]              = a.placementIndex
-                                break
-                            end
-                        end
-                    end
-                end
-
+                local tId, model = resolveTowerIdForAction(a, macroData)
                 if model and tId and Remotes.TowerUpgrade then
                     local towerName = a.towerName
                     if not towerName or towerName == "" or towerName == "Unknown" then
@@ -1206,8 +1362,6 @@ local function executeReplay(macroData)
                     if currentLvl >= targetLvl then return end
 
                     local cost = getTowerUpgradeCost(towerName, targetLvl, a.cost)
-
-                    -- Persistent upgrade loop so Godly $27,000 upgrade never times out after 6 attempts!
                     local upgraded = false
                     while not upgraded and S.replaying and isMatchActive() and Controller.Running do
                         if S.skipCurrentStep then S.skipCurrentStep = false break end
@@ -1237,34 +1391,36 @@ local function executeReplay(macroData)
                         addLog(string.format("Upgraded: #%d (%s) -> Lvl %d", a.placementIndex, towerName, targetLvl))
                     end
                 end
-                task.wait(0.1)
+                task.wait(0.20)
 
             elseif a.type == "sell" then
                 local status = awaitCashAndPause(0, "Sell #" .. tostring(a.placementIndex))
                 if status == "ABORT" then S.replaying = false return end
                 if status ~= "SKIP" then
-                    local tId = ReplayTowers[a.placementIndex]
+                    local tId = resolveTowerIdForAction(a, macroData)
                     if tId and Remotes.TowerSell then
                         pcall(function() Remotes.TowerSell:FireServer({ Id = tId }) end)
                         ReplayTowers[a.placementIndex] = nil
                         UsedTowerIds[tId]              = nil
                         ActiveTowerLevels[tId]         = nil
+                        ActiveTowerModes[tId]          = nil
+                        MyOwnedTowerIds[tId]           = nil
                         addLog(string.format("Sold Unit #%d", a.placementIndex))
                     end
                 end
-                task.wait(0.1)
+                task.wait(0.20)
 
             elseif a.type == "target" then
                 local status = awaitCashAndPause(0, "Target #" .. tostring(a.placementIndex))
                 if status == "ABORT" then S.replaying = false return end
                 if status ~= "SKIP" then
-                    local tId = ReplayTowers[a.placementIndex]
+                    local tId = resolveTowerIdForAction(a, macroData)
                     if tId and Remotes.TowerTarget then
                         pcall(function() Remotes.TowerTarget:FireServer({ Id = tId }) end)
                         addLog(string.format("Target Mode #%d -> %s", a.placementIndex, tostring(a.targetMode)))
                     end
                 end
-                task.wait(0.1)
+                task.wait(0.20)
             end
         end)
     end
@@ -1278,12 +1434,20 @@ local function executeReplay(macroData)
     setMatchStatusText(not isMatchActive() and "🏁 Match Ended" or "✅ Replay Complete")
 end
 
--- ==================== 8. BUILD OBSIDIAN WINDOW & TABS ====================
+-- ==================== 7. BUILD OBSIDIAN WINDOW & TABS (RESPONSIVE MOBILE + PC) ====================
+local cam      = workspace.CurrentCamera
+local vp       = cam and cam.ViewportSize or Vector2.new(1280, 720)
+local isMobile = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+local winW     = math.min(660, math.max(360, math.floor(vp.X - (isMobile and 28 or 60))))
+local winH     = math.min(490, math.max(260, math.floor(vp.Y - (isMobile and 36 or 90))))
+local posX     = isMobile and math.max(10, math.floor((vp.X - winW) * 0.5)) or 28
+local posY     = isMobile and math.max(16, math.floor((vp.Y - winH) * 0.5)) or 54
+
 local Window = Library:CreateWindow({
-    Title                = "⚡ CAMERA TD // STUDIO v5.7",
-    Footer               = "v5.7 Obsidian Edition | Match Studio",
-    Position             = UDim2.fromOffset(28, 70),
-    Size                 = UDim2.fromOffset(660, 490),
+    Title                = "⚡ CAMERA TD // STUDIO v5.8",
+    Footer               = "v5.8 Obsidian Edition | Match Studio",
+    Position             = UDim2.fromOffset(posX, posY),
+    Size                 = UDim2.fromOffset(winW, winH),
     NotifySide           = "Right",
     ShowCustomCursor     = false,
     Center               = false,
@@ -1292,6 +1456,22 @@ local Window = Library:CreateWindow({
     MobileButtonsSide    = "Left",
     ToggleKeybind        = Enum.KeyCode.RightControl
 })
+
+ENV.__CAM_TD_ACTIVE_GUIS = ENV.__CAM_TD_ACTIVE_GUIS or {}
+for _, container in ipairs(getGuiContainers()) do
+    for _, child in ipairs(container:GetChildren()) do
+        if child:IsA("ScreenGui") and not beforeGuis[child] then
+            pcall(function() child:SetAttribute("__CAM_TD_UI", true) end)
+            table.insert(Controller.UIs, child)
+            table.insert(ENV.__CAM_TD_ACTIVE_GUIS, child)
+        end
+    end
+end
+
+if Controller.Unloaded or ENV.__CAM_TD_EXEC_SEQ ~= myExecSeq then
+    Controller.Unload()
+    return
+end
 
 local Tabs = {
     Macro    = Window:AddTab("Macro Studio", "clapperboard"),
@@ -1554,9 +1734,10 @@ StatusLabels.MacroSummary = MacroTimelineGroup:AddLabel("Profile: None | Actions
 MacroTimelineGroup:AddDivider()
 StatusLabels.Timeline     = MacroTimelineGroup:AddLabel("No actions recorded or loaded.", true)
 
--- ---------- TAB: IN-GAME AUTOMATION ----------
-local WaveSkipGroup  = Tabs.Match:AddLeftGroupbox("Wave-Skip Filter", "fast-forward")
-local MatchAutoGroup = Tabs.Match:AddRightGroupbox("Match Automation", "bot")
+-- ---------- TAB: IN-GAME AUTOMATION + LOBBY AUTO-TP CONTROL ----------
+local WaveSkipGroup    = Tabs.Match:AddLeftGroupbox("Wave-Skip Filter", "fast-forward")
+local LobbyReturnGroup = Tabs.Match:AddLeftGroupbox("Lobby & Auto-TP Control", "compass")
+local MatchAutoGroup   = Tabs.Match:AddRightGroupbox("Match Automation", "bot")
 
 WaveSkipGroup:AddToggle("AutoSkipToggle", {
     Text    = "Auto Skip Wave",
@@ -1589,6 +1770,80 @@ WaveSkipGroup:AddToggle("SyncSkipMultiAccToggle", {
     Callback = function(Value)
         S.syncSkipMultiAcc = Value
         saveS()
+    end
+})
+
+LobbyReturnGroup:AddToggle("AutoTeleportToggle", {
+    Text    = "Auto Teleport & Start (Lobby)",
+    Default = S.autoJoinMatch == true,
+    Tooltip = "Turn OFF to prevent Lobby.lua from auto-joining the next match when you leave.",
+    Callback = function(Value)
+        if S.autoJoinMatch ~= Value then
+            S.autoJoinMatch = Value
+            saveS()
+            addLog(Value and "✅ Lobby Auto-TP Enabled (will auto-join in Lobby)" or "⏹ Lobby Auto-TP Disabled (will stay in Lobby)")
+            notify("Lobby Auto-TP", Value and "Enabled for Lobby return" or "Disabled! You will stay in Lobby.", 3)
+        end
+    end
+})
+
+local lobbyMapsList = { "Toilet City", "Desert", "Cameraman HQ", "Halloween Town" }
+if S.selectedMap ~= "" and not table.find(lobbyMapsList, S.selectedMap) then
+    table.insert(lobbyMapsList, S.selectedMap)
+    table.sort(lobbyMapsList)
+end
+
+LobbyReturnGroup:AddDropdown("MatchLobbyMapDropdown", {
+    Values   = lobbyMapsList,
+    Default  = table.find(lobbyMapsList, S.selectedMap) or 1,
+    Multi    = false,
+    Text     = "Lobby Target Map",
+    Callback = function(Value)
+        local clean = cleanStr(Value)
+        if clean ~= "" and clean ~= S.selectedMap then
+            S.selectedMap = clean
+            saveS()
+        end
+    end
+})
+
+LobbyReturnGroup:AddSlider("MatchJoinCountdownSlider", {
+    Text     = "Lobby Join Countdown",
+    Default  = tonumber(S.joinCountdown) or 7,
+    Min      = 1,
+    Max      = 15,
+    Rounding = 0,
+    Suffix   = "s",
+    Callback = function(Value)
+        S.joinCountdown = Value
+        saveS()
+    end
+})
+
+LobbyReturnGroup:AddButton({
+    Text        = "🏠 Return To Lobby",
+    DoubleClick = true,
+    Tooltip     = "Double-click to leave the match and return to Lobby.",
+    Func = function()
+        safeCall("ReturnToLobbyBtn", function()
+            if S.autoExecute and ENV.__CAM_TD_TP_ARMED ~= true then
+                armAutoExecute(false)
+            end
+            local leaveEv = Remotes.OnLeave
+            if not leaveEv then
+                local ml  = RS:FindFirstChild("ModuleLoader")
+                local sh  = ml and ml:FindFirstChild("Shared")
+                local net = sh and sh:FindFirstChild("Network")
+                local re  = net and net:FindFirstChild("RemoteEvent")
+                leaveEv = re and re:FindFirstChild("OnLeave")
+            end
+            if leaveEv then
+                leaveEv:FireServer()
+                addLog("🏠 Returning to Lobby...")
+            else
+                notify("Return To Lobby", "OnLeave remote not ready yet.", 3)
+            end
+        end)
     end
 })
 
@@ -1699,8 +1954,6 @@ ExecGroup:AddButton({
     Text = "⚡ Arm Auto-Execute Now",
     Func = function()
         S.autoExecute = true
-        S.teleportQueued = false
-        ENV.__CAM_TD_TP_ARMED = false
         saveS()
         armAutoExecute(true)
     end
@@ -1800,7 +2053,14 @@ pcall(function()
         ThemeManager:SetLibrary(Library)
         SaveManager:SetLibrary(Library)
         SaveManager:IgnoreThemeSettings()
-        SaveManager:SetIgnoreIndexes({ "MenuKeybind", "MacroNameInput", "MacroFileSelect" })
+        SaveManager:SetIgnoreIndexes({
+            "MenuKeybind",
+            "MacroNameInput",
+            "MacroFileSelect",
+            "AutoTeleportToggle",
+            "MatchLobbyMapDropdown",
+            "MatchJoinCountdownSlider"
+        })
         ThemeManager:SetFolder(FOLDER)
         SaveManager:SetFolder(FOLDER .. "/obsidian_configs")
         SaveManager:BuildConfigSection(Tabs.Settings)
@@ -1808,32 +2068,13 @@ pcall(function()
     end
 end)
 
-function Controller.Unload()
-    if Controller.Unloaded then return end
-    Controller.Unloaded  = true
-    Controller.Running   = false
-    _G.__CAM_TD_MACRO    = false
-    if S.recording and #recData.actions > 0 then
-        autoFlushRecordingToDisk()
-    end
-    S.recording          = false
-    S.replaying          = false
-    ENV.__CAM_TD_HOOK_CB = nil
-    saveS()
-    for _, c in ipairs(Controller.Connections) do
-        pcall(function() c:Disconnect() end)
-    end
-    table.clear(Controller.Connections)
-    pcall(function() Library:Unload() end)
-end
-
 Library:OnUnload(function()
     Controller.Unload()
 end)
 
--- ==================== 9. ENGINE LINKER & SUPERVISOR LOOP ====================
+-- ==================== 8. ENGINE LINKER & SUPERVISOR LOOP ====================
 task.spawn(function()
-    addLog("Initializing Camera TD Engine (v5.7 Obsidian)...")
+    addLog("Initializing Camera TD Engine (v5.8 Obsidian)...")
     pcall(function() loadMacroByName(S.macroName) end)
     updateMacroTimelineUI()
 
@@ -1864,6 +2105,7 @@ task.spawn(function()
                     Remotes.ModeVote     = re:FindFirstChild("ModeVote")
                     Remotes.WaveSkip     = re:FindFirstChild("WaveSkip")
                     Remotes.PlayAgain    = re:FindFirstChild("PlayAgain")
+                    Remotes.OnLeave      = re:FindFirstChild("OnLeave")
                     Remotes.ChangeSpeed  = rf:FindFirstChild("ChangeSpeed")
 
                     if Remotes.TowerAdd and Remotes.TowerUpgrade then
@@ -1884,6 +2126,8 @@ task.spawn(function()
     local lastBlockedWaveLog   = 0
     local lastPlayAgainAttempt = 0
     local lastSpeedAttemptTime = 0
+    local lastModeVoteAttempt  = 0
+    local lastSkipAttempt      = 0
     local speedFailCount       = 0
 
     while Controller.Running do
@@ -1937,9 +2181,9 @@ task.spawn(function()
                     end
                 end
 
-                -- 2. Gamemode Auto-Vote
+                -- 2. Gamemode Auto-Vote (Rate-limit safe >= 1.0s)
                 local autoVoteOn = (Toggles.AutoVoteModeToggle and Toggles.AutoVoteModeToggle.Value == true)
-                if autoVoteOn and isVoting and Remotes.ModeVote then
+                if autoVoteOn and isVoting and Remotes.ModeVote and (tick() - lastModeVoteAttempt >= 1.0) then
                     local modeClean = cleanStr((Options.VoteModeDropdown and Options.VoteModeDropdown.Value) or S.selectedMode)
                     local votersRaw = workspace:GetAttribute(modeClean .. "Voters")
                     local alreadyVoted = false
@@ -1950,12 +2194,13 @@ task.spawn(function()
                         end
                     end
                     if not alreadyVoted then
+                        lastModeVoteAttempt = tick()
                         pcall(function() Remotes.ModeVote:FireServer(modeClean) end)
                         addLog("🗳️ Voted Mode: " .. modeClean)
                     end
                 end
 
-                -- 3. Wave Skip Enforcer
+                -- 3. Wave Skip Enforcer (Rate-limit safe >= 0.75s)
                 local autoSkipOn = (Toggles.AutoSkipToggle and Toggles.AutoSkipToggle.Value == true)
                 if autoSkipOn and isPlaying and Remotes.WaveSkip then
                     if workspace:GetAttribute("CanSkip") == true then
@@ -1964,7 +2209,8 @@ task.spawn(function()
                                 lastBlockedWaveLog = curWave
                                 addLog(string.format("🛑 Auto-Skip paused on Wave %d (Filter: %s)", curWave, S.noSkipWaves))
                             end
-                        else
+                        elseif tick() - lastSkipAttempt >= 0.75 then
+                            lastSkipAttempt = tick()
                             pcall(function() Remotes.WaveSkip:FireServer() end)
                         end
                     end
@@ -1977,7 +2223,7 @@ task.spawn(function()
                     end
                     speedRejectedInMatch = false
                     speedFailCount       = 0
-                    if S.autoExecute and not S.teleportQueued then
+                    if S.autoExecute and ENV.__CAM_TD_TP_ARMED ~= true then
                         armAutoExecute(false)
                     end
                     local autoReplayOn = (Toggles.AutoReplayToggle and Toggles.AutoReplayToggle.Value == true)
@@ -1997,6 +2243,7 @@ task.spawn(function()
                     table.clear(ReplayTowers)
                     table.clear(UsedTowerIds)
                     table.clear(ActiveTowerLevels)
+                    table.clear(ActiveTowerModes)
                     updateMacroTimelineUI()
                     addLog("⏹ Replay Reset: Match transitioned to Voting/Lobby.")
                 end
@@ -2063,4 +2310,5 @@ task.spawn(function()
     end
 end)
 
-notify("Camera TD v5.7 Loaded", "In-Game Match Mode Active!", 4)
+notify("Camera TD v5.8 Loaded", "In-Game Match Mode Active!", 4)
+local function isMyTower
