@@ -1,10 +1,12 @@
 -- ============================================================================
--- CAMERA TD // DEDICATED LOBBY MODULE (Lobby.lua v6.0)
--- Features:
---   1. Cancellable Countdown Auto-Join + 4-Pad Free Elevator Resolver
---   2. Live Match Modifiers Sync & Clear (Hp_Mobs, Speed_Mobs)
---   3. Fast Auto-Summon (1x / 10x) + Animation Skip
---   4. Pre-Match Macro & Gamemode Configuration (shared JSON with Match.lua)
+-- CAMERA TD // DEDICATED LOBBY MODULE (Lobby.lua v6.1)
+-- Fixes:
+--   1. Pre-yield Singleton Guard + full Obsidian ScreenGui cleanup
+--   2. Fixed tonumber(str:gsub(...)) 2nd return value bug in getLobbyCoins()
+--   3. Rate-limit safe Auto-Summon (2.05s matches RemoteSecurity Delay=2)
+--   4. Prevented queue_on_teleport duplicate stacking on mobile executors
+--   5. Responsive mobile viewport sizing + getconnections click fallback
+--   6. Added Match Speed & Refresh Macros to Match Pre-Config + DPI Scale
 -- ============================================================================
 
 if not game:IsLoaded() then
@@ -17,34 +19,100 @@ local FOLDER            = "CameraTD_Macro"
 local DELAY_FILE        = FOLDER .. "/startup_delay.txt"
 local CACHE_DIR         = FOLDER .. "/cache"
 local LOADER_CACHE      = CACHE_DIR .. "/loader_cache.luau"
+local OBSIDIAN_LIB_CACHE = CACHE_DIR .. "/obsidian_library.luau"
 
--- ==================== 1. SINGLETON CLEANUP GUARD ====================
-local ENV = (getgenv and getgenv()) or _G
-if ENV.__CAM_TD_CONTROLLER then
-    pcall(function()
-        ENV.__CAM_TD_CONTROLLER.Unload()
-    end)
-    task.wait(0.2)
-end
-
-local Controller = { Running = true, Connections = {}, Unloaded = false }
-ENV.__CAM_TD_CONTROLLER = Controller
-
-local function trackConn(conn)
-    if conn then
-        table.insert(Controller.Connections, conn)
-    end
-    return conn
-end
-
--- ==================== 2. SERVICES & LOGGING ====================
-local Players     = game:GetService("Players")
-local RS          = game:GetService("ReplicatedStorage")
-local HttpService = game:GetService("HttpService")
-local VirtualUser = nil
+local Players          = game:GetService("Players")
+local RS               = game:GetService("ReplicatedStorage")
+local HttpService      = game:GetService("HttpService")
+local UserInputService = game:GetService("UserInputService")
+local VirtualUser      = nil
 pcall(function() VirtualUser = game:GetService("VirtualUser") end)
 
 local LP = Players.LocalPlayer or Players.PlayerAdded:Wait()
+
+-- ==================== 1. HARD SINGLETON & UI CLEANUP GUARD ====================
+local ENV = (getgenv and getgenv()) or _G
+local myExecSeq = (ENV.__CAM_TD_EXEC_SEQ or 0) + 1
+ENV.__CAM_TD_EXEC_SEQ = myExecSeq
+
+local function getGuiContainers()
+    local list = {}
+    if gethui then
+        local ok, h = pcall(gethui)
+        if ok and typeof(h) == "Instance" then
+            table.insert(list, h)
+        end
+    end
+    pcall(function()
+        local cg = game:GetService("CoreGui")
+        if cg then table.insert(list, cg) end
+    end)
+    local pg = LP and LP:FindFirstChildOfClass("PlayerGui")
+    if pg then
+        table.insert(list, pg)
+    end
+    return list
+end
+
+local function isCameraTdScreenGui(gui)
+    if not gui or not gui:IsA("ScreenGui") then return false end
+    if gui.Name == "CameraTD_PrecisionV47" or gui:GetAttribute("__CAM_TD_UI") == true then
+        return true
+    end
+    if gui.Name == "Obsidian" then
+        for _, desc in ipairs(gui:GetDescendants()) do
+            if desc:IsA("TextLabel") and type(desc.Text) == "string" and desc.Text:find("CAMERA TD //", 1, true) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+local function destroyAllCameraTdUIs()
+    pcall(function()
+        if ENV.__CAM_TD_OBSIDIAN_LIB and type(ENV.__CAM_TD_OBSIDIAN_LIB.Unload) == "function" then
+            pcall(function() ENV.__CAM_TD_OBSIDIAN_LIB:Unload() end)
+        end
+        ENV.__CAM_TD_OBSIDIAN_LIB = nil
+
+        if type(ENV.__CAM_TD_ACTIVE_GUIS) == "table" then
+            for _, g in ipairs(ENV.__CAM_TD_ACTIVE_GUIS) do
+                pcall(function()
+                    if typeof(g) == "Instance" and g.Parent then
+                        g:Destroy()
+                    end
+                end)
+            end
+        end
+        ENV.__CAM_TD_ACTIVE_GUIS = {}
+
+        for _, container in ipairs(getGuiContainers()) do
+            for _, child in ipairs(container:GetChildren()) do
+                if isCameraTdScreenGui(child) then
+                    pcall(function() child:Destroy() end)
+                end
+            end
+        end
+    end)
+end
+
+if ENV.__CAM_TD_CONTROLLER then
+    pcall(function()
+        if type(ENV.__CAM_TD_CONTROLLER.Unload) == "function" then
+            ENV.__CAM_TD_CONTROLLER.Unload()
+        end
+    end)
+end
+destroyAllCameraTdUIs()
+task.wait(0.05)
+
+if ENV.__CAM_TD_EXEC_SEQ ~= myExecSeq then
+    return
+end
+
+local Controller = { Running = true, Connections = {}, Unloaded = false, UIs = {} }
+local Library = nil
 
 local MACRO_FOLDER     = FOLDER .. "/macros"
 local SETTINGS_FILE    = FOLDER .. "/" .. LP.Name .. "_settings.json"
@@ -62,64 +130,6 @@ local function ensureFolders()
 end
 ensureFolders()
 
-local logEntries     = {}
-local StatusLabels   = {}
-local lastLabelTexts = {}
-
-local function cleanStr(val)
-    if type(val) ~= "string" then return tostring(val or "") end
-    return val:gsub("^<%s*", ""):gsub("%s*>$", ""):match("^%s*(.-)%s*$") or ""
-end
-
-local function setLabel(labelObj, text)
-    if not labelObj then return end
-    local str = tostring(text or "")
-    if lastLabelTexts[labelObj] == str then return end
-    lastLabelTexts[labelObj] = str
-    pcall(function()
-        labelObj:SetText(str)
-    end)
-end
-
-local function addLog(text, isError)
-    local prefix = isError and "[ERROR] " or ""
-    local line = os.date("%H:%M:%S") .. " | " .. prefix .. tostring(text)
-    table.insert(logEntries, 1, line)
-    if #logEntries > 30 then
-        logEntries[31] = nil
-    end
-    pcall(function()
-        if appendfile and isfile and isfile(LOG_FILE) then
-            appendfile(LOG_FILE, line .. "\n")
-        elseif writefile then
-            writefile(LOG_FILE, line .. "\n")
-        end
-    end)
-    if isError then
-        warn("[CameraTD Lobby] " .. tostring(text))
-    else
-        print("[CameraTD Lobby] " .. tostring(text))
-    end
-    if StatusLabels.Console then
-        setLabel(StatusLabels.Console, table.concat(logEntries, "\n"))
-    end
-end
-
-local function safeCall(context, fn, ...)
-    local args = { ... }
-    local ok, res = xpcall(function()
-        return fn(table.unpack(args))
-    end, function(err)
-        return tostring(err)
-    end)
-    if not ok then
-        addLog(context .. " error: " .. tostring(res), true)
-        return false, res
-    end
-    return true, res
-end
-
--- ==================== 3. SHARED SETTINGS & MACRO PROFILES ====================
 local function saveJSON(path, data)
     local ok = false
     pcall(function()
@@ -141,30 +151,24 @@ local function loadJSON(path)
     return (ok and type(res) == "table") and res or nil
 end
 
-local function listMacroFiles()
-    local names, seen = {}, {}
-    pcall(function()
-        if listfiles and isfolder and isfolder(MACRO_FOLDER) then
-            for _, file in ipairs(listfiles(MACRO_FOLDER)) do
-                local name = tostring(file):gsub("\\", "/"):match("([^/]+)%.json$")
-                if name and not seen[name] then
-                    seen[name] = true
-                    table.insert(names, name)
-                end
-            end
-        end
-    end)
-    table.sort(names)
-    if #names == 0 then
-        table.insert(names, "Farm")
-    end
-    return names
+local function cleanStr(val)
+    if type(val) ~= "string" then return tostring(val or "") end
+    return val:gsub("^<%s*", ""):gsub("%s*>$", ""):match("^%s*(.-)%s*$") or ""
+end
+
+local function parseDigits(val)
+    if type(val) == "number" then return val end
+    if type(val) ~= "string" then return nil end
+    local digits = val:gsub("[^%d]", "")
+    if digits == "" then return nil end
+    return tonumber(digits, 10)
 end
 
 local bootDelay = 7
 pcall(function()
     if isfile and readfile and isfile(DELAY_FILE) then
-        local num = tonumber(readfile(DELAY_FILE):match("([%d%.]+)"))
+        local matchStr = readfile(DELAY_FILE):match("([%d%.]+)")
+        local num = matchStr and tonumber(matchStr, 10)
         if num and num >= 1 and num <= 60 then bootDelay = num end
     end
 end)
@@ -245,7 +249,6 @@ S.selectedModifiers = normalizeModifiersTable(S.selectedModifiers)
 if not S.useModifiers then
     S.selectedModifiers = {}
 end
-
 S.teleportQueued = ENV.__CAM_TD_TP_ARMED == true
 
 local function saveS()
@@ -264,20 +267,170 @@ local function saveS()
         end
     end)
 end
+
+-- Register Unload BEFORE any yielding HTTP requests so concurrent re-execs can cleanly abort this instance
+function Controller.Unload()
+    if Controller.Unloaded then return end
+    Controller.Unloaded = true
+    Controller.Running  = false
+    saveS()
+    for _, c in ipairs(Controller.Connections) do
+        pcall(function() c:Disconnect() end)
+    end
+    table.clear(Controller.Connections)
+    if Library then
+        pcall(function() Library:Unload() end)
+    end
+    for _, g in ipairs(Controller.UIs) do
+        pcall(function()
+            if typeof(g) == "Instance" and g.Parent then
+                g:Destroy()
+            end
+        end)
+    end
+    table.clear(Controller.UIs)
+    if ENV.__CAM_TD_CONTROLLER == Controller then
+        ENV.__CAM_TD_CONTROLLER = nil
+    end
+end
+
+ENV.__CAM_TD_CONTROLLER = Controller
 saveS()
 
--- ==================== 4. LOAD OBSIDIAN UI LIBRARY ====================
-local Library, ThemeManager, SaveManager
+local function trackConn(conn)
+    if conn then
+        if Controller.Unloaded then
+            pcall(function() conn:Disconnect() end)
+            return conn
+        end
+        table.insert(Controller.Connections, conn)
+    end
+    return conn
+end
+
+-- ==================== 2. LOGGING & FILE HELPERS ====================
+local logEntries     = {}
+local StatusLabels   = {}
+local lastLabelTexts = {}
+
+local function setLabel(labelObj, text)
+    if not labelObj then return end
+    local str = tostring(text or "")
+    if lastLabelTexts[labelObj] == str then return end
+    lastLabelTexts[labelObj] = str
+    pcall(function()
+        labelObj:SetText(str)
+    end)
+end
+
+local function addLog(text, isError)
+    local prefix = isError and "[ERROR] " or ""
+    local line = os.date("%H:%M:%S") .. " | " .. prefix .. tostring(text)
+    table.insert(logEntries, 1, line)
+    if #logEntries > 30 then
+        logEntries[31] = nil
+    end
+    pcall(function()
+        if appendfile and isfile and isfile(LOG_FILE) then
+            appendfile(LOG_FILE, line .. "\n")
+        elseif writefile then
+            writefile(LOG_FILE, line .. "\n")
+        end
+    end)
+    if isError then
+        warn("[CameraTD Lobby] " .. tostring(text))
+    else
+        print("[CameraTD Lobby] " .. tostring(text))
+    end
+    if StatusLabels.Console then
+        setLabel(StatusLabels.Console, table.concat(logEntries, "\n"))
+    end
+end
+
+local function safeCall(context, fn, ...)
+    local args = { ... }
+    local ok, res = xpcall(function()
+        return fn(table.unpack(args))
+    end, function(err)
+        return tostring(err)
+    end)
+    if not ok then
+        addLog(context .. " error: " .. tostring(res), true)
+        return false, res
+    end
+    return true, res
+end
+
+local function listMacroFiles()
+    local names, seen = {}, {}
+    pcall(function()
+        if listfiles and isfolder and isfolder(MACRO_FOLDER) then
+            for _, file in ipairs(listfiles(MACRO_FOLDER)) do
+                local name = tostring(file):gsub("\\", "/"):match("([^/]+)%.json$")
+                if name and not seen[name] then
+                    seen[name] = true
+                    table.insert(names, name)
+                end
+            end
+        end
+    end)
+    table.sort(names)
+    if #names == 0 then
+        table.insert(names, "Farm")
+    end
+    return names
+end
+
+-- ==================== 3. LOAD OBSIDIAN UI LIBRARY (WITH CACHE FALLBACK) ====================
+local function fetchModuleWithCache(url, cachePath)
+    local src = nil
+    local ok, res = pcall(function()
+        return game:HttpGet(url)
+    end)
+    if ok and type(res) == "string" and #res > 100 and not res:match("^404:") then
+        src = res
+        pcall(function()
+            if writefile then
+                ensureFolders()
+                writefile(cachePath, src)
+            end
+        end)
+    elseif isfile and readfile then
+        pcall(function()
+            if isfile(cachePath) then
+                src = readfile(cachePath)
+            end
+        end)
+    end
+    if not src then return nil end
+    local fn = loadstring(src)
+    return fn and fn() or nil
+end
+
+local beforeGuis = {}
+for _, container in ipairs(getGuiContainers()) do
+    for _, child in ipairs(container:GetChildren()) do
+        if child:IsA("ScreenGui") then
+            beforeGuis[child] = true
+        end
+    end
+end
+
 safeCall("LoadObsidianLibrary", function()
-    Library      = loadstring(game:HttpGet(OBSIDIAN_REPO .. "Library.lua"))()
-    ThemeManager = loadstring(game:HttpGet(OBSIDIAN_REPO .. "addons/ThemeManager.lua"))()
-    SaveManager  = loadstring(game:HttpGet(OBSIDIAN_REPO .. "addons/SaveManager.lua"))()
+    Library = fetchModuleWithCache(OBSIDIAN_REPO .. "Library.lua", OBSIDIAN_LIB_CACHE)
 end)
+
+if Controller.Unloaded or ENV.__CAM_TD_EXEC_SEQ ~= myExecSeq then
+    if Library then pcall(function() Library:Unload() end) end
+    return
+end
 
 if not Library then
     warn("[CameraTD Lobby] Critical: Could not load Obsidian Library.")
     return
 end
+
+ENV.__CAM_TD_OBSIDIAN_LIB = Library
 
 local Options = Library.Options
 local Toggles = Library.Toggles
@@ -294,8 +447,17 @@ local function notify(title, desc, duration)
     end)
 end
 
--- ==================== 5. TELEPORT AUTO-EXECUTE & FPS CAP ====================
+-- ==================== 4. TELEPORT AUTO-EXECUTE & FPS CAP ====================
 local function armAutoExecute(showLog)
+    if ENV.__CAM_TD_TP_ARMED == true then
+        S.teleportQueued = true
+        if showLog then
+            addLog("✅ Auto-Execute is already armed (duplicate blocked).")
+            notify("Auto-Execute", "Already armed for next teleport!", 3)
+        end
+        return true
+    end
+
     local qFunc = queue_on_teleport
         or queueonteleport
         or (syn and syn.queue_on_teleport)
@@ -308,42 +470,39 @@ local function armAutoExecute(showLog)
         return false
     end
 
-    if not S.teleportQueued then
-        local payload = string.format([[
-            if not game:IsLoaded() then game.Loaded:Wait() end
-            local ok, src = pcall(function()
-                return game:HttpGet(%q .. "?t=" .. tostring(os.time()))
-            end)
-            if ok and type(src) == "string" and #src > 60 then
-                if writefile then pcall(writefile, %q, src) end
-                local fn = loadstring(src)
-                if fn then task.spawn(fn) return end
-            end
-            if isfile and readfile and isfile(%q) then
-                local fn = loadstring(readfile(%q))
-                if fn then task.spawn(fn) end
-            end
-        ]], GITHUB_LOADER_URL, LOADER_CACHE, LOADER_CACHE, LOADER_CACHE)
-
-        local ok, err = pcall(qFunc, payload)
-        if ok then
-            S.teleportQueued = true
-            ENV.__CAM_TD_TP_ARMED = true
-            if showLog then
-                addLog("✅ Auto-Execute Armed (Loader + Cache)!")
-                notify("Auto-Execute", "Armed for next teleport!", 3)
-            end
-            return true
-        else
-            if showLog then addLog("❌ Auto-Exec Error: " .. tostring(err), true) end
-            return false
+    local payload = string.format([[
+        local E = (getgenv and getgenv()) or _G
+        local now = os.clock()
+        if E.__CAM_TD_PAYLOAD_LOCK and (now - E.__CAM_TD_PAYLOAD_LOCK) < 4 then return end
+        E.__CAM_TD_PAYLOAD_LOCK = now
+        E.__CAM_TD_FROM_TP = true
+        if not game:IsLoaded() then game.Loaded:Wait() end
+        local ok, src = pcall(function()
+            return game:HttpGet(%q .. "?t=" .. tostring(os.time()))
+        end)
+        if ok and type(src) == "string" and #src > 60 then
+            if writefile then pcall(writefile, %q, src) end
+            local fn = loadstring(src)
+            if fn then task.spawn(fn) return end
         end
-    else
+        if isfile and readfile and isfile(%q) then
+            local fn = loadstring(readfile(%q))
+            if fn then task.spawn(fn) end
+        end
+    ]], GITHUB_LOADER_URL, LOADER_CACHE, LOADER_CACHE, LOADER_CACHE)
+
+    local ok, err = pcall(qFunc, payload)
+    if ok then
+        S.teleportQueued = true
+        ENV.__CAM_TD_TP_ARMED = true
         if showLog then
-            addLog("✅ Auto-Execute is already armed!")
-            notify("Auto-Execute", "Already armed for teleport!", 3)
+            addLog("✅ Auto-Execute Armed (Loader + Cache)!")
+            notify("Auto-Execute", "Armed for next teleport!", 3)
         end
         return true
+    else
+        if showLog then addLog("❌ Auto-Exec Error: " .. tostring(err), true) end
+        return false
     end
 end
 
@@ -351,8 +510,14 @@ if S.autoExecute then
     armAutoExecute(false)
 end
 
-trackConn(LP.OnTeleport:Connect(function()
-    if S.autoExecute and not S.teleportQueued then
+local isTeleportingOut = false
+trackConn(LP.OnTeleport:Connect(function(state)
+    if state == Enum.TeleportState.Started or state == Enum.TeleportState.InProgress then
+        isTeleportingOut = true
+    elseif state == Enum.TeleportState.Failed then
+        isTeleportingOut = false
+    end
+    if S.autoExecute and ENV.__CAM_TD_TP_ARMED ~= true then
         armAutoExecute(false)
     end
 end))
@@ -382,11 +547,41 @@ task.spawn(function()
     end
 end)
 
--- ==================== 6. LOBBY REMOTES & ELEVATOR HELPERS ====================
+-- ==================== 5. LOBBY REMOTES & ELEVATOR HELPERS ====================
 local LobbyRemotes       = {}
 local LobbyEngineReady   = false
 local activeElevatorName = nil
 local ConfigModule       = nil
+
+local function clickGuiButton(btn)
+    if not btn or not btn:IsA("GuiButton") then return false end
+    local clicked = false
+    if firesignal then
+        pcall(function()
+            firesignal(btn.Activated)
+            clicked = true
+        end)
+        if not clicked then
+            pcall(function()
+                firesignal(btn.MouseButton1Click)
+                clicked = true
+            end)
+        end
+    end
+    if not clicked and getconnections then
+        pcall(function()
+            for _, conn in ipairs(getconnections(btn.Activated)) do
+                pcall(function() conn:Fire() end)
+                clicked = true
+            end
+            for _, conn in ipairs(getconnections(btn.MouseButton1Click)) do
+                pcall(function() conn:Fire() end)
+                clicked = true
+            end
+        end)
+    end
+    return clicked
+end
 
 local function getNetworkRemote(name)
     local found = nil
@@ -448,9 +643,7 @@ local function dismissLobbyLoadingScreen()
         local playBtn = loadingGui:FindFirstChild("Play")
         if playBtn and playBtn:IsA("GuiButton") and playBtn.Visible and playBtn.Interactable then
             loadingDismissedOnce = true
-            if firesignal then
-                pcall(function() firesignal(playBtn.Activated) end)
-            end
+            clickGuiButton(playBtn)
             addLog("Clicked Lobby Play button automatically.")
         end
     end)
@@ -561,13 +754,14 @@ end
 local function getLobbyCoins()
     local coins = 0
     pcall(function()
-        local hud = LP:FindFirstChild("PlayerGui") and LP.PlayerGui:FindFirstChild("HUD")
+        local pg = LP:FindFirstChildOfClass("PlayerGui")
+        local hud = pg and pg:FindFirstChild("HUD")
         local amtLbl = hud and hud:FindFirstChild("Currencies")
             and hud.Currencies:FindFirstChild("Money")
             and hud.Currencies.Money:FindFirstChild("CurrencyFrame")
             and hud.Currencies.Money.CurrencyFrame:FindFirstChild("AmountLabel")
         if amtLbl and amtLbl:IsA("TextLabel") and amtLbl.Text ~= "" then
-            local num = tonumber(amtLbl.Text:gsub("[^%d]", ""))
+            local num = parseDigits(amtLbl.Text)
             if num then
                 coins = num
                 return
@@ -576,18 +770,26 @@ local function getLobbyCoins()
         local ls = LP:FindFirstChild("leaderstats")
         local cObj = ls and (ls:FindFirstChild("Coins") or ls:FindFirstChild("Money"))
         if cObj then
-            coins = tonumber(tostring(cObj.Value):gsub("[^%d]", "")) or 0
+            coins = parseDigits(tostring(cObj.Value)) or 0
         end
     end)
     return coins
 end
 
--- ==================== 7. BUILD OBSIDIAN WINDOW & TABS (LOBBY EDITION) ====================
+-- ==================== 6. BUILD OBSIDIAN WINDOW & TABS (RESPONSIVE MOBILE + PC) ====================
+local cam      = workspace.CurrentCamera
+local vp       = cam and cam.ViewportSize or Vector2.new(1280, 720)
+local isMobile = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+local winW     = math.min(660, math.max(360, math.floor(vp.X - (isMobile and 28 or 60))))
+local winH     = math.min(490, math.max(260, math.floor(vp.Y - (isMobile and 36 or 90))))
+local posX     = isMobile and math.max(10, math.floor((vp.X - winW) * 0.5)) or 28
+local posY     = isMobile and math.max(16, math.floor((vp.Y - winH) * 0.5)) or 54
+
 local Window = Library:CreateWindow({
-    Title                = "⚡ CAMERA TD // LOBBY STUDIO v6.0",
-    Footer               = "v6.0 Modular Lobby Engine | Auto-Join & Summon",
-    Position             = UDim2.fromOffset(28, 70),
-    Size                 = UDim2.fromOffset(660, 490),
+    Title                = "⚡ CAMERA TD // LOBBY v6.1",
+    Footer               = "v6.1 Modular Lobby Engine | Auto-Join & Summon",
+    Position             = UDim2.fromOffset(posX, posY),
+    Size                 = UDim2.fromOffset(winW, winH),
     NotifySide           = "Right",
     ShowCustomCursor     = false,
     Center               = false,
@@ -596,6 +798,23 @@ local Window = Library:CreateWindow({
     MobileButtonsSide    = "Left",
     ToggleKeybind        = Enum.KeyCode.RightControl
 })
+
+-- Tag & track newly created Obsidian ScreenGuis so re-execution always destroys them
+ENV.__CAM_TD_ACTIVE_GUIS = ENV.__CAM_TD_ACTIVE_GUIS or {}
+for _, container in ipairs(getGuiContainers()) do
+    for _, child in ipairs(container:GetChildren()) do
+        if child:IsA("ScreenGui") and not beforeGuis[child] then
+            pcall(function() child:SetAttribute("__CAM_TD_UI", true) end)
+            table.insert(Controller.UIs, child)
+            table.insert(ENV.__CAM_TD_ACTIVE_GUIS, child)
+        end
+    end
+end
+
+if Controller.Unloaded or ENV.__CAM_TD_EXEC_SEQ ~= myExecSeq then
+    Controller.Unload()
+    return
+end
 
 local Tabs = {
     Lobby    = Window:AddTab("Lobby Auto", "compass"),
@@ -672,7 +891,7 @@ JoinGroup:AddDropdown("ElevatorModifiersDropdown", {
 })
 
 JoinGroup:AddButton({
-    Text = "🧹 Clear Modifiers",
+    Text = "🧹 Clear Mods",
     Func = function()
         S.useModifiers = false
         S.selectedModifiers = {}
@@ -717,7 +936,7 @@ JoinGroup:AddSlider("JoinCountdownSlider", {
 
 JoinGroup:AddToggle("AutoJoinMatchToggle", {
     Text    = "Auto Teleport & Start",
-    Default = S.autoJoinMatch,
+    Default = S.autoJoinMatch == true,
     Callback = function(Value)
         S.autoJoinMatch = Value
         saveS()
@@ -761,7 +980,7 @@ SummonGroup:AddDropdown("SummonAmountDropdown", {
 
 SummonGroup:AddToggle("AutoSummonToggle", {
     Text    = "Fast Auto Summon",
-    Default = S.autoSummon,
+    Default = S.autoSummon == true,
     Callback = function(Value)
         S.autoSummon = Value
         saveS()
@@ -781,9 +1000,11 @@ SummonGroup:AddButton({
                     notify("Summon", "SummonTowers remote not ready.", 3)
                     return
                 end
-                local res = rf:InvokeServer(cleanStr(S.summonCrate or "Basic Crate"), 1)
+                local res, code = rf:InvokeServer(cleanStr(S.summonCrate or "Basic Crate"), 1)
                 if type(res) == "table" and #res > 0 then
                     addLog("Summoned 1x: Got " .. tostring(res[1].Name or "Unit"))
+                elseif code then
+                    addLog("Summon 1x status: " .. tostring(code))
                 end
             end)
         end)
@@ -798,9 +1019,11 @@ SummonGroup:AddButton({
                     notify("Summon", "SummonTowers remote not ready.", 3)
                     return
                 end
-                local res = rf:InvokeServer(cleanStr(S.summonCrate or "Basic Crate"), 10)
+                local res, code = rf:InvokeServer(cleanStr(S.summonCrate or "Basic Crate"), 10)
                 if type(res) == "table" and #res > 0 then
                     addLog("Summoned 10x: Got " .. tostring(#res) .. " units!")
+                elseif code then
+                    addLog("Summon 10x status: " .. tostring(code))
                 end
             end)
         end)
@@ -810,7 +1033,7 @@ SummonGroup:AddButton({
 SummonGroup:AddDivider()
 SummonGroup:AddToggle("AutoDismissLoadingToggle", {
     Text    = "Skip Loading Screen",
-    Default = S.autoDismissLoading,
+    Default = S.autoDismissLoading ~= false,
     Callback = function(Value)
         S.autoDismissLoading = Value
         saveS()
@@ -838,6 +1061,20 @@ PreMacroGroup:AddDropdown("LobbyMacroSelect", {
     end
 })
 
+PreMacroGroup:AddButton({
+    Text = "↻ Refresh Macros",
+    Func = function()
+        safeCall("RefreshLobbyMacros", function()
+            local list = listMacroFiles()
+            Options.LobbyMacroSelect:SetValues(list)
+            if table.find(list, S.macroName) then
+                Options.LobbyMacroSelect:SetValue(S.macroName)
+            end
+            notify("Macros", "Found " .. tostring(#list) .. " profile(s).", 2)
+        end)
+    end
+})
+
 PreMacroGroup:AddToggle("PreAutoPlayMacroToggle", {
     Text    = "Auto Macro On Wave 1",
     Default = S.autoPlay,
@@ -852,6 +1089,30 @@ PreMacroGroup:AddToggle("PreAutoReplayToggle", {
     Default = S.autoReplay,
     Callback = function(Value)
         S.autoReplay = Value
+        saveS()
+    end
+})
+
+PreAutoGroup:AddToggle("PreAutoSpeedToggle", {
+    Text    = "Auto Game Speed",
+    Default = S.autoSpeed,
+    Callback = function(Value)
+        S.autoSpeed = Value
+        saveS()
+    end
+})
+
+local speedMap        = { ["1x Speed"] = 1, ["1.5x Speed"] = 1.5, ["2x Speed"] = 2 }
+local speedLabels     = { "1x Speed", "1.5x Speed", "2x Speed" }
+local defaultSpeedIdx = (S.speedChoice == 1 and 1) or (S.speedChoice == 1.5 and 2) or 3
+PreMacroGroup:AddDropdown("PreSpeedChoiceDropdown", {
+    Values   = speedLabels,
+    Default  = defaultSpeedIdx,
+    Multi    = false,
+    Text     = "Target Game Speed",
+    Callback = function(Value)
+        local clean = cleanStr(Value)
+        S.speedChoice = speedMap[clean] or 2
         saveS()
     end
 })
@@ -931,8 +1192,6 @@ ExecGroup:AddButton({
     Text = "⚡ Arm Auto-Execute Now",
     Func = function()
         S.autoExecute = true
-        S.teleportQueued = false
-        ENV.__CAM_TD_TP_ARMED = false
         saveS()
         armAutoExecute(true)
     end
@@ -965,6 +1224,18 @@ LogGroup:AddButton({
 })
 StatusLabels.Console = LogGroup:AddLabel("Initializing Lobby Studio...", true)
 
+MenuGroup:AddDropdown("DPIDropdown", {
+    Values   = { "50%", "75%", "90%", "100%", "125%", "150%" },
+    Default  = "100%",
+    Text     = "UI Scale (DPI)",
+    Callback = function(Value)
+        local num = parseDigits(tostring(Value))
+        if num then
+            pcall(function() Library:SetDPIScale(num) end)
+        end
+    end
+})
+
 MenuGroup:AddLabel("Menu Keybind"):AddKeyPicker("MenuKeybind", {
     Default = "RightControl",
     NoUI    = true,
@@ -979,23 +1250,11 @@ MenuGroup:AddButton({
     end
 })
 
-function Controller.Unload()
-    if Controller.Unloaded then return end
-    Controller.Unloaded = true
-    Controller.Running  = false
-    saveS()
-    for _, c in ipairs(Controller.Connections) do
-        pcall(function() c:Disconnect() end)
-    end
-    table.clear(Controller.Connections)
-    pcall(function() Library:Unload() end)
-end
-
 Library:OnUnload(function()
     Controller.Unload()
 end)
 
--- ==================== 8. LOBBY ENGINE LINKER, AUTO-SUMMON & AUTO-JOIN LOOPS ====================
+-- ==================== 7. LOBBY ENGINE LINKER, AUTO-SUMMON & AUTO-JOIN LOOPS ====================
 task.spawn(function()
     while Controller.Running do
         safeCall("LobbyLinker", function()
@@ -1037,7 +1296,7 @@ task.spawn(function()
     end
 end)
 
--- Fast Auto-Summon Loop
+-- Rate-limit aligned Fast Auto-Summon Loop (RemoteSecurity.SummonTowers.Delay = 2s)
 task.spawn(function()
     local summonCount = 0
     while Controller.Running do
@@ -1050,7 +1309,8 @@ task.spawn(function()
                 end
 
                 pcall(function()
-                    local mainGui = LP:FindFirstChild("PlayerGui") and LP.PlayerGui:FindFirstChild("Main")
+                    local pg = LP:FindFirstChildOfClass("PlayerGui")
+                    local mainGui = pg and pg:FindFirstChild("Main")
                     local sumFrame = mainGui and mainGui:FindFirstChild("SummonedFrame")
                     if sumFrame and sumFrame.Visible then
                         sumFrame.Visible = false
@@ -1091,7 +1351,7 @@ task.spawn(function()
                     ))
                 end
             end)
-            task.wait(0.55)
+            task.wait(2.05)
         else
             task.wait(0.4)
         end
@@ -1116,8 +1376,8 @@ task.spawn(function()
             local pg = LP:FindFirstChildOfClass("PlayerGui")
             local qf = pg and pg:FindFirstChild("ElevatorGui") and pg.ElevatorGui:FindFirstChild("QueueFrame")
             local readyBtn = qf and qf:FindFirstChild("ReadyButton")
-            if readyBtn and readyBtn.Visible and firesignal then
-                firesignal(readyBtn.Activated)
+            if readyBtn and readyBtn.Visible then
+                clickGuiButton(readyBtn)
             end
         end)
         if startRf and elevName then
@@ -1136,13 +1396,19 @@ task.spawn(function()
                 getLobbyCoins(), targetMap, modText
             ))
 
+            if isTeleportingOut then
+                setLabel(StatusLabels.Countdown, "🚀 Teleporting into Match...")
+                task.wait(1.0)
+                return
+            end
+
             local autoJoinOn = (Toggles.AutoJoinMatchToggle and Toggles.AutoJoinMatchToggle.Value == true)
             if not autoJoinOn then
                 leaveActiveElevator()
                 return
             end
 
-            if S.autoExecute and not S.teleportQueued then
+            if S.autoExecute and ENV.__CAM_TD_TP_ARMED ~= true then
                 armAutoExecute(false)
             end
 
@@ -1214,7 +1480,7 @@ task.spawn(function()
             if not enteredOk then
                 local char = LP.Character
                 local hrp  = char and char:FindFirstChild("HumanoidRootPart")
-                if hrp and areaPart then
+                if hrp and areaPart and areaPart.Parent then
                     hrp.AssemblyLinearVelocity  = Vector3.zero
                     hrp.AssemblyAngularVelocity = Vector3.zero
                     hrp.CFrame = areaPart.CFrame
@@ -1268,14 +1534,14 @@ task.spawn(function()
                 return
             end
 
-            task.wait(0.35)
+            task.wait(0.55)
 
             if modRf then
                 local modList = getActiveUIModifiersList()
                 if #modList > 0 then
                     pcall(function() modRf:InvokeServer(elev.Name, modList) end)
                     addLog("Applied Modifiers: " .. table.concat(modList, ", "))
-                    task.wait(0.35)
+                    task.wait(0.55)
                 else
                     pcall(function() modRf:InvokeServer(elev.Name, {}) end)
                 end
@@ -1288,7 +1554,11 @@ task.spawn(function()
             addLog(string.format("✅ Fired Start on %s (%s)! Waiting for teleport...", elev.Name, targetMap))
 
             local waitStart = tick()
-            while tick() - waitStart < 12.0 and Controller.Running do
+            while tick() - waitStart < 15.0 and Controller.Running do
+                if isTeleportingOut then
+                    task.wait(0.5)
+                    continue
+                end
                 if not (Toggles.AutoJoinMatchToggle and Toggles.AutoJoinMatchToggle.Value) then
                     leaveActiveElevator()
                     addLog("⏹ Left elevator queue (Auto-Join unchecked).")
@@ -1296,8 +1566,9 @@ task.spawn(function()
                 end
                 local char = LP.Character
                 local hrp  = char and char:FindFirstChild("HumanoidRootPart")
-                if hrp and areaPart and (hrp.Position - areaPart.Position).Magnitude > 6 then
-                    hrp.AssemblyLinearVelocity = Vector3.zero
+                if hrp and areaPart and areaPart.Parent and (hrp.Position - areaPart.Position).Magnitude > 6 then
+                    hrp.AssemblyLinearVelocity  = Vector3.zero
+                    hrp.AssemblyAngularVelocity = Vector3.zero
                     hrp.CFrame = areaPart.CFrame
                 end
                 if tick() - lastStartTry >= 3.2 then
@@ -1311,4 +1582,4 @@ task.spawn(function()
     end
 end)
 
-notify("Camera TD Lobby v6.0", "Lobby Module Loaded!", 4)
+notify("Camera TD Lobby v6.1", "Lobby Module Loaded!", 4)
